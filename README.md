@@ -1,5 +1,9 @@
 # wow-claude
 
+<p align="center">
+  <img src="docs/screenshot.jpg" alt="The WoW Claude chat window open in Goldshire, with a message on its way to Claude Code" width="900">
+</p>
+
 Chat with your local [Claude Code](https://claude.com/claude-code) sessions from inside **World of Warcraft: Forever** — send a task, go back to questing, get pinged in-game when the answer lands. No alt-tabbing, no `/reload` per message.
 
 - Multiple chats, each its own persistent Claude session (like separate terminals), running in parallel
