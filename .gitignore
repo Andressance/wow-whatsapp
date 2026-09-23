@@ -1,0 +1,14 @@
+# machine-specific / runtime state
+bridge/config.json
+bridge/state.json
+bridge/transcripts.json
+bridge/bridge.log
+*.tmp
+
+# tooling
+node_modules/
+tests/tmp/
+
+# OS / local artifacts
+.DS_Store
+*.zip
