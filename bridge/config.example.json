@@ -19,6 +19,8 @@
   },
   "claudePath": "",
   "model": "",
+  "gameContext": true,
+  "primerFile": "docs/WOW-ADDON-PRIMER.md",
   "permissionMode": "acceptEdits",
   "allowedTools": [
     "WebSearch",

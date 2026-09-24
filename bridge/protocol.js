@@ -85,27 +85,36 @@ function sameFolder(a, b) {
 
 // Flags field: ';'-separated tokens. "n" = fresh Claude session, "h" = hello
 // (no prompt), "d" = the player deleted this chat: forget its transcript and
-// session (no prompt), "allow=Rule1,Rule2" = add these permission rules before running.
+// session (no prompt), "allow=Rule1,Rule2" = add these permission rules before
+// running, "c" = the record carries a game-context field before the text (an
+// empty one clears the context the bridge keeps).
 function parseFlags(flags) {
-  const out = { newSession: false, hello: false, forget: false, allow: [] };
+  const out = { newSession: false, hello: false, forget: false, context: false, allow: [] };
   for (const tok of String(flags || '').split(';')) {
     if (tok === 'n') out.newSession = true;
     else if (tok === 'h') out.hello = true;
     else if (tok === 'd') out.forget = true;
+    else if (tok === 'c') out.context = true;
     else if (tok.startsWith('allow=')) out.allow.push(...tok.slice(6).split(',').map(s => s.trim()).filter(Boolean));
   }
   return out;
 }
 
 // Strip payload: records separated by \x1E, fields by \x1F:
-//   session, chat, id, cwd, flags, name, text
+//   session, chat, id, cwd, flags, name, [ctx,] text
 // `cwd` is left as typed; the bridge resolves it against its default folder.
+// The ctx field is only there when the flags say "c" (older addons never set
+// it), so a separator inside the text can't be mistaken for it.
 function jobsFromStrip(headerId, payload) {
   const jobs = [];
   for (const rec of String(payload).split('\x1E')) {
     const p = rec.split('\x1F');
     if (p.length >= 7 && /^\d+$/.test(p[2])) {
-      jobs.push({ session: p[0], chat: p[1], id: Number(p[2]), cwd: p[3], ...parseFlags(p[4]), name: p[5], text: p.slice(6).join('\x1F'), via: 'pixel' });
+      const flags = parseFlags(p[4]);
+      const withCtx = flags.context && p.length >= 8;
+      const job = { session: p[0], chat: p[1], id: Number(p[2]), cwd: p[3], ...flags, name: p[5], text: p.slice(withCtx ? 7 : 6).join('\x1F'), via: 'pixel' };
+      if (withCtx) job.ctx = p[6];
+      jobs.push(job);
     } else if (p.length === 6 && /^\d+$/.test(p[2])) { // previous format without the chat name
       jobs.push({ session: p[0], chat: p[1], id: Number(p[2]), cwd: p[3], ...parseFlags(p[4]), name: '', text: p[5], via: 'pixel' });
     } else if (p.length === 4) { // pre-chat format: session, cwd, flags, text
@@ -128,7 +137,39 @@ function parseOutbox(src) {
   const session = (b.match(/\["session"\]\s*=\s*"([0-9a-zA-Z]*)"/) || [])[1] || '';
   const chat = (b.match(/\["chat"\]\s*=\s*"([0-9a-zA-Z]*)"/) || [])[1] || '';
   const newSession = /\["newSession"\]\s*=\s*true/.test(b);
-  return { id, session, chat, text, cwd, newSession, via: 'reload' };
+  const job = { id, session, chat, text, cwd, newSession, via: 'reload' };
+  const ctx = b.match(/\["ctx"\]\s*=\s*"([0-9a-fA-F]*)"/);
+  if (ctx) job.ctx = fromHex(ctx[1]);
+  return job;
+}
+
+// ---------------------------------------------------------------------------
+// Game context
+// ---------------------------------------------------------------------------
+
+// What Claude is told about where the message comes from, appended to its
+// system prompt on every run while the addon has sent a context (the player's
+// character, location and so on; see GameContext in WoWClaude.lua), plus the
+// addon/macro primer (docs/WOW-ADDON-PRIMER.md) so it can write for this
+// client whatever folder the chat works in. Empty context = nothing appended,
+// primer included, so a bridge used for unrelated projects, or an addon with
+// `/wow-claude context off`, leaves Claude exactly as it was.
+function systemPrompt(ctx, primer) {
+  const text = String(ctx || '').trim();
+  if (!text) return '';
+  const lines = [
+    'The user is talking to you from inside World of Warcraft through the wow-claude addon. They type in a small in-game window and your reply is shown there as plain text (markdown is not rendered), so keep replies compact and formatting simple.',
+    '',
+    'Their in-game situation when the message was written, as reported by the addon:',
+    text,
+    '',
+    'Use this when the request is about the game or the character (questions, macros, addon code, gear advice); ignore it when the task is unrelated. Items, spells or quests the player shift-clicked into a message appear as [Name] in the text, with their tooltip in a "Linked from the game" block at the end of the message.',
+  ];
+  const ref = String(primer || '').trim();
+  if (ref) {
+    lines.push('', 'Reference for writing addons and macros for this client. Follow it when the task is about WoW, and check anything it marks as uncertain against the Blizzard UI source it names:', '', ref);
+  }
+  return lines.join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -237,7 +278,7 @@ module.exports = {
   fromHex, pad3, slotNumber, chatKey, sessKey,
   alreadyHandled, markHandled, pruneStale, MONTH_MS,
   resolveCwd, sameFolder,
-  parseFlags, jobsFromStrip, parseOutbox,
+  parseFlags, jobsFromStrip, parseOutbox, systemPrompt,
   ruleFor, describeToolUse,
   luaStr, luaTable, SILENT_WAV,
 };
