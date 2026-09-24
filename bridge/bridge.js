@@ -306,6 +306,39 @@ function readOutbox() {
   return P.parseOutbox(src);
 }
 
+// The addon sends the player's in-game context (character, location, ...) with
+// its hello and again whenever it changes; an empty one means "context off".
+// It is kept in state.json so a restarted bridge still has it, and goes into
+// Claude's system prompt on every run (see protocol.systemPrompt).
+function setContext(job) {
+  const text = String(job.ctx || '').replace(/\r/g, '').trim().slice(0, 2000);
+  const prev = (state.context && state.context.text) || '';
+  if (text === prev) return;
+  state.context = text ? { text, at: Date.now(), session: job.session || '' } : null;
+  saveState();
+  const who = (text.split('\n').find(l => /^Character:/i.test(l)) || text.split('\n')[0] || '').slice(0, 100);
+  log(`#${job.id}${job.session ? '@' + job.session : ''} game context ${text ? 'updated: ' + who : 'cleared'}`);
+}
+
+function gameContext() {
+  if (cfg.gameContext === false) return '';
+  return (state.context && state.context.text) || '';
+}
+
+// The addon/macro primer that goes into the system prompt with the context.
+// Read on every run so edits count without a restart; "" in the config turns
+// it off. Relative paths are taken from the repo (docs/WOW-ADDON-PRIMER.md).
+const PRIMER_FILE = cfg.primerFile === undefined ? 'docs/WOW-ADDON-PRIMER.md' : cfg.primerFile;
+let warnedNoPrimer = false;
+function primer() {
+  if (!PRIMER_FILE) return '';
+  const file = path.resolve(REPO, PRIMER_FILE);
+  try { return fs.readFileSync(file, 'utf8'); } catch (e) {
+    if (!warnedNoPrimer) { warnedNoPrimer = true; log(`primer: cannot read ${file} (${e.code || e.message}); running without it`); }
+    return '';
+  }
+}
+
 // Persist newly allowed rules so they stick across bridge restarts.
 function allowRules(rules) {
   const current = new Set(cfg.allowedTools || []);
@@ -326,6 +359,7 @@ function allowRules(rules) {
 
 function submit(job) {
   if (alreadyHandled(job)) return;
+  if (job.ctx !== undefined) setContext(job);
   if (job.forget) {
     // A deleted chat: forget it and ack. No Claude run.
     markHandled(job);
@@ -405,11 +439,13 @@ function runJob(job) {
   if (Array.isArray(cfg.allowedTools) && cfg.allowedTools.length) args.push('--allowedTools', ...cfg.allowedTools);
   if (cfg.model) args.push('--model', cfg.model);
   if (resume) args.push('--resume', resume);
+  const sys = P.systemPrompt(gameContext(), primer());
+  if (sys) args.push('--append-system-prompt', sys);
 
   const env = { ...process.env };
   delete env.CLAUDECODE;
 
-  log(`${tag} (${job.via}) starting in ${cwd}${resume ? ' (resume ' + resume.slice(0, 8) + ')' : ' (new session)'}${running.size ? ' [' + (running.size + 1) + ' running]' : ''}`);
+  log(`${tag} (${job.via}) starting in ${cwd}${resume ? ' (resume ' + resume.slice(0, 8) + ')' : ' (new session)'}${sys ? ' [game context]' : ''}${running.size ? ' [' + (running.size + 1) + ' running]' : ''}`);
   const child = spawn(resolveClaude(), args, { cwd, env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
   running.set(key, { job, child });
   publish(key, { chat: job.chat, id: job.id, status: 'working', text: resume ? 'thinking...' : 'starting a new session...', cwd, session: resume }, true);
@@ -552,6 +588,9 @@ function banner() {
   console.log(`  claude   : ${resolveClaude()}`);
   console.log(`  mode     : ${cfg.permissionMode}, ${(cfg.allowedTools || []).length} allowed tool rules`);
   console.log(`  sessions : ${Object.keys(state.sessions).length} saved`);
+  const ctx = gameContext();
+  console.log(`  context  : ${cfg.gameContext === false ? 'off (gameContext in config.json)' : ctx ? (ctx.split('\n').find(l => /^Character:/i.test(l)) || ctx.split('\n')[0]).slice(0, 100) : 'none yet (the addon sends it with its hello; /wow-claude context in game)'}`);
+  console.log(`  primer   : ${!PRIMER_FILE ? 'off (primerFile in config.json)' : primer() ? path.resolve(REPO, PRIMER_FILE) + ' (' + primer().length + ' chars, with the context)' : 'NOT FOUND: ' + path.resolve(REPO, PRIMER_FILE)}`);
   console.log('Leave this window open while you play. Ctrl+C to stop.\n');
 }
 

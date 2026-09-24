@@ -21,6 +21,8 @@ The bridge reads `config.json` once at start. Restart it after editing, except f
 | `permissionMode` | `"acceptEdits"` | Passed to `claude -p --permission-mode`. `acceptEdits` auto-approves file edits inside the working folder; `bypassPermissions` approves everything; `default` denies anything not in `allowedTools`. |
 | `allowedTools` | git, npm, npx, node, python, pip, pytest, ls, dir, WebSearch, WebFetch | Rules passed to `claude -p --allowedTools`. `Bash(git:*)` allows any command starting with `git`. The **Allow & retry** button in game appends rules here permanently. |
 | `model` | `""` | Passed to `claude -p --model` when non-empty. Empty uses Claude Code's default. |
+| `gameContext` | `true` | Put the character/zone context the addon sends into Claude's system prompt (`--append-system-prompt`). `false` ignores it, for a bridge only ever used on unrelated projects. The addon has its own switch, `/wow-claude context off`, which also clears what the bridge holds. |
+| `primerFile` | `"docs/WOW-ADDON-PRIMER.md"` | A markdown file appended to the system prompt together with the game context, whatever folder the chat works in: how to write addons and macros for this client. Relative to the wow-claude folder, or absolute. Re-read on every run, so edits count at once. `""` sends none. Off whenever the context is off. |
 | `maxParallel` | `3` | How many chats may run Claude at the same time. Further messages queue per chat. |
 | `timeoutMs` | `1800000` (30 min) | A Claude run longer than this is killed and reported as an error in game. |
 | `progressWriteMs` | `3000` | Minimum gap between progress writes to the slot files. Final replies are written immediately. |
@@ -92,7 +94,7 @@ All of these are gitignored.
 | File | Contents |
 |---|---|
 | `bridge/config.json` | Your configuration. |
-| `bridge/state.json` | Claude session ids per chat, the folder each session ran in, handled message ids per addon session token, and the presence counter. Delete it to forget all sessions. |
+| `bridge/state.json` | Claude session ids per chat, the folder each session ran in, handled message ids per addon session token, the presence counter, and the latest game context the addon sent (`context`). Delete it to forget all sessions. |
 | `bridge/transcripts.json` | The last 200 messages of every chat, so the addon can recover its chats after the client wipes saved data. |
 | `bridge/bridge.log` | Everything printed to the console, with timestamps. Grows without bound; delete it whenever you like. |
 

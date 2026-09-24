@@ -9,6 +9,7 @@ Chat with your local [Claude Code](https://claude.com/claude-code) sessions from
 - Multiple chats, each its own persistent Claude session (like separate terminals), running in parallel
 - Live progress while Claude works: action count, elapsed time, the files it's editing and commands it's running
 - Replies echoed into the game chat; `/r` replies to Claude when it was the last to message you
+- Claude knows your character, level, zone, talents and professions (optional), and you can shift-click items, spells and quests into a message
 - An **Allow & retry** button when Claude needs a command outside your allowlist
 - A status light for the bridge, automatic retries, and recovery of your chats if the beta client wipes addon data
 
@@ -78,6 +79,7 @@ Right-clicking a chat in the left panel opens a small menu with **Rename...** an
 | `/wow-claude chat <n\|name>` | switch chats (or click the left panel; right-click a row for Rename and Folder, its trash can deletes it) |
 | `/wow-claude cd <folder>` | folder this chat's Claude works in (**Folder...** after right-clicking the chat opens the same thing as a dialog). Relative to the bridge's folder (`/wow-claude cd realms`, `/wow-claude cd ../other`), `~` works, a full path too; `/wow-claude cd` alone goes back to the bridge's default. A chat that changes folder starts a fresh Claude session there |
 | `/wow-claude reset` | wipe this chat's Claude memory, keep the transcript |
+| `/wow-claude context [on\|off]` | show what Claude is told about your character and location, or turn it on/off |
 | `/wow-claude rename`, `/wow-claude delete`, `/wow-claude clear` | manage the current chat |
 | `/wow-claude echo full\|short\|off\|<chars>` | how much of each reply to print into the game chat (default 4000 chars) |
 | `/wow-claude longchat on` | let the game chat box take 4000 characters, for long `/ai` messages |
@@ -90,6 +92,16 @@ Right-clicking a chat in the left panel opens a small menu with **Rename...** an
 | `/wow-claude help` | the full list |
 
 Click any message, or `/wow-claude copy` for the last reply, to open it in a selectable box for Ctrl+C.
+
+### Claude knows where you are
+
+The addon tells Claude which game and client you are on, your character (name, realm, level, race, class, faction, guild), where you are (zone, subzone and the map coordinates the minimap shows), your money, talents and professions. A few lines, sent with the addon's hello and again whenever they change, and put into Claude's system prompt by the bridge, so you can ask "what should I be doing at my level around here?" or "write me a macro for my class" without explaining yourself first. It is only a hint: for a chat about an unrelated project it changes nothing. `/wow-claude context` shows exactly what is sent; `/wow-claude context off` stops sending it (the bridge forgets it too), and `"gameContext": false` in `bridge/config.json` turns it off for good.
+
+Along with it, every run gets [docs/WOW-ADDON-PRIMER.md](docs/WOW-ADDON-PRIMER.md): a short reference on writing addons and macros for this client (TOC layout, sandbox rules, common frames and events, where to verify an API), so "write me an addon that..." works from any folder, not just this repo. Edit the file to suit your setup; the bridge re-reads it on every run. `"primerFile": ""` in the config drops it, and `/wow-claude context off` turns it off together with the character context.
+
+### Link items, spells and quests
+
+Click the input box, then **shift-click** an item in your bags, a spell in the spellbook, a quest in the log, or a link in the chat: it lands in your message the way it would in the game chat. When you send, each link becomes `[Name]` in the text and its tooltip (an item's stats, a spell's description) is attached below, so Claude sees what you see when hovering it. This works from the game chat box too (`/ai is this an upgrade? [Fine Longsword]`). Without a box focused, shift-click keeps its normal meaning.
 
 ### Permissions
 
@@ -104,6 +116,8 @@ The keys you are most likely to touch. Every key, flag and environment variable 
 | `defaultCwd` | folder for chats that haven't been given one with `/wow-claude cd` |
 | `maxParallel` | how many chats may run Claude at once (default 3) |
 | `permissionMode`, `allowedTools`, `model` | passed to `claude -p` |
+| `gameContext` | `false` never tells Claude about your character, whatever the addon sends (default `true`) |
+| `primerFile` | the addon/macro primer appended with the context (default `docs/WOW-ADDON-PRIMER.md`; `""` = none) |
 | `capture.processName` | the game exe without `.exe` (`WowB` for Forever); set by `setup.js` |
 | `slots`, `actMax`, `presenceMax` | pool sizes; must match the constants at the top of `WoWClaude.lua` if you change them |
 | `timeoutMs` | kill a run that takes longer than this (default 30 min) |

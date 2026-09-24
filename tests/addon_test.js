@@ -73,7 +73,10 @@ function stripRecords(vm) {
   if (!frame) return [];
   return frame.text.split('\x1E').map(r => {
     const p = r.split('\x1F');
-    return { session: p[0], chat: p[1], id: Number(p[2]), cwd: p[3], flags: p[4], name: p[5], text: p.slice(6).join('\x1F') };
+    const withCtx = p[4].split(';').includes('c'); // a "c" flag means field 7 is the game context
+    const rec = { session: p[0], chat: p[1], id: Number(p[2]), cwd: p[3], flags: p[4], name: p[5], text: p.slice(withCtx ? 7 : 6).join('\x1F') };
+    if (withCtx) rec.ctx = p[6];
+    return rec;
   });
 }
 
@@ -114,9 +117,93 @@ test('hello goes out on the strip after login', () => {
   vm.run('STUB.RunTimers()'); // C_Timer.After(3, SayHello)
   const recs = stripRecords(vm);
   assert.equal(recs.length, 1);
-  assert.equal(recs[0].flags, 'h');
+  assert.equal(recs[0].flags, 'h;c', 'a hello always carries the game context');
   assert.equal(recs[0].text, '');
   assert.equal(recs[0].session, vm.evaluate('WoWClaudeDB.session'));
+});
+
+test('the game context describes the character and rides on the hello, then only when it changes or is turned off', () => {
+  const vm = newVM();
+  login(vm);
+  vm.run('STUB.RunTimers()');
+  const hello = stripRecords(vm)[0];
+  assert.deepEqual(hello.ctx.split('\n'), [
+    'Game: World of Warcraft: Forever (client 1.60.1.69913, interface 16001)',
+    'Character: Testchar on Test Realm, level 23 Night Elf Hunter (Alliance), guild <Test Guild>',
+    'Location: Duskwood - Darkshire',
+    'Position: 45.2, 67.8 (map 1431)',
+    'Money: 1g 23s 45c; XP: 1234/5000',
+    'Talents: Beast Mastery 10 / Marksmanship 5 / Survival 0',
+    'Professions: Skinning 75/75, First Aid 40/75',
+  ]);
+  // The bridge answers the hello: the context is now known to be on its side.
+  nextSlot(vm, '{ now = time(), cwd = "", replies = {} }');
+  vm.run('STUB.now = STUB.now + 6; STUB.Tick()');
+  assert.equal(vm.evaluate('WoWClaude.IsConnected()'), 'true');
+  vm.run('WoWClaude.Send("hello world")');
+  let rec = stripRecords(vm).find(r => r.text === 'hello world');
+  assert.equal(rec.flags, '', 'unchanged context is not repeated');
+  assert.equal(rec.ctx, undefined);
+  assert.equal(vm.evaluate('WoWClaudeDB.outbox.ctx'), null);
+  // Moving to another zone changes it, so the next message (from another chat,
+  // the first one is still waiting) carries the new version.
+  vm.run('STUB.zone = "Elwynn Forest"; STUB.subzone = ""; STUB.posX = 0.1; WoWClaude.NewChat("Second"); WoWClaude.Send("where am I")');
+  rec = stripRecords(vm).find(r => r.text === 'where am I');
+  assert.equal(rec.flags, 'c');
+  assert.ok(rec.ctx.includes('Location: Elwynn Forest\n'), rec.ctx);
+  assert.ok(rec.ctx.includes('Position: 10.0, 67.8 on Duskwood (map 1431)'), 'the map name shows when it differs from the zone');
+  assert.equal(Buffer.from(vm.evaluate('WoWClaudeDB.outbox.ctx'), 'hex').toString('utf8'), rec.ctx, 'the reload path carries it too');
+  // Turning it off sends an empty context at once (a hello), so the bridge drops what it had.
+  vm.run('SlashCmdList.WOWCLAUDE("context off")');
+  assert.equal(vm.evaluate('WoWClaudeDB.settings.context'), 'false');
+  const off = stripRecords(vm).filter(r => r.flags === 'h;c');
+  assert.equal(off.length, 1);
+  assert.equal(off[0].ctx, '');
+  assert.ok(vm.evaluate('WoWClaudeDB.chats[2].history[#WoWClaudeDB.chats[2].history].text').includes('Game context is OFF'));
+  // Back on: another hello, with the context again.
+  vm.run('SlashCmdList.WOWCLAUDE("context on")');
+  const on = stripRecords(vm).filter(r => r.flags === 'h;c');
+  assert.ok(on.some(r => r.ctx.includes('Character: Testchar')));
+  assert.ok(vm.evaluate('WoWClaudeDB.chats[2].history[#WoWClaudeDB.chats[2].history].text').includes('Game context is ON'));
+});
+
+test('a shift-clicked link lands in the focused input and is sent as its name plus tooltip', () => {
+  const vm = newVM();
+  login(vm);
+  connect(vm);
+  const link = '|cff1eff00|Hitem:2140:0:0:0:0:0:0:0:60:0:0|h[Fine Longsword]|h|r';
+  vm.run(`STUB.tooltips["item:2140:0:0:0:0:0:0:0:60:0:0"] = { "Fine Longsword", { "Main Hand", "Sword" }, { "17 - 33 Damage", "Speed 2.70" }, "Requires Level 14" }`);
+  // Without focus the link is left alone (shift-click keeps its normal meaning).
+  vm.run(`WoWClaudeInput:SetText("is this good for me? "); WoWClaudeInput:ClearFocus(); ChatFrameUtil.InsertLink("${link}")`);
+  assert.equal(vm.evaluate('WoWClaudeInput:GetText()'), 'is this good for me? ');
+  // The client's own path (bags, spellbook, quest log all end here): ChatFrameUtil.InsertLink.
+  vm.run(`WoWClaudeInput:SetFocus(); ChatFrameUtil.InsertLink("${link}")`);
+  assert.equal(vm.evaluate('WoWClaudeInput:GetText()'), 'is this good for me? ' + link);
+  // The old global name is not hooked as well, so nothing is inserted twice.
+  vm.run(`ChatEdit_InsertLink("${link}")`);
+  assert.equal(vm.evaluate('WoWClaudeInput:GetText()'), 'is this good for me? ' + link + link, 'the alias reaches the one hook exactly once');
+  vm.run(`WoWClaudeInput:SetText("is this good for me? ${link}")`);
+  vm.run('WoWClaude.SendFromInput()');
+  const expected = [
+    'is this good for me? [Fine Longsword]',
+    '',
+    '--- Linked from the game ---',
+    '[Fine Longsword] item 2140 (Uncommon)',
+    '  Fine Longsword',
+    '  Main Hand  Sword',
+    '  17 - 33 Damage  Speed 2.70',
+    '  Requires Level 14',
+  ].join('\n');
+  const rec = stripRecords(vm).find(r => r.text.startsWith('is this good'));
+  assert.equal(rec.text, expected);
+  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].history[#WoWClaudeDB.chats[1].history].text'), expected, 'the transcript shows what was sent');
+  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].name'), 'Is this good for me');
+  // Bare links (no colour) and repeated links: one block each, tooltip or not.
+  vm.run('RESULT = (WoWClaude.ExpandLinks("x |Hspell:1978|h[Serpent Sting]|h y |Hspell:1978|h[Serpent Sting]|h"))');
+  assert.equal(vm.evaluate('RESULT'), 'x [Serpent Sting] y [Serpent Sting]\n\n--- Linked from the game ---\n[Serpent Sting] spell 1978');
+  vm.run('RESULT, COUNT = WoWClaude.ExpandLinks("plain text | with a pipe")');
+  assert.equal(vm.evaluate('RESULT'), 'plain text | with a pipe');
+  assert.equal(vm.evaluate('COUNT'), '0');
 });
 
 test('deleting a chat tells the bridge to forget it, and a restore never brings it back', () => {
@@ -159,7 +246,7 @@ test('until the bridge answers, Connect replaces Send and a message stays in the
   assert.equal(vm.evaluate('WoWClaudeInput:GetText()'), 'fix the bug', 'message kept in the box');
   const hello = stripRecords(vm);
   assert.equal(hello.length, 1);
-  assert.equal(hello[0].flags, 'h', 'a hello went out instead');
+  assert.equal(hello[0].flags, 'h;c', 'a hello went out instead');
   assert.ok(texts().includes('Connecting...'));
   assert.ok(texts().includes('your message goes out as soon as it answers'));
   // No answer within CONNECT_WAIT: the attempt is reported as failed, Connect is back.
