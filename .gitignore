@@ -3,6 +3,8 @@ bridge/config.json
 bridge/state.json
 bridge/transcripts.json
 bridge/bridge.log
+.wwebjs_auth/
+.wwebjs_cache/
 *.tmp
 
 # tooling

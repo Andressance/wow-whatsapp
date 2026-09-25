@@ -1,5 +1,5 @@
 -- A minimal stand-in for the WoW addon environment, enough to load and drive
--- WoWClaude.lua outside the game (see addon_test.js). Frames are plain tables:
+-- WoWWhatsApp.lua outside the game (see addon_test.js). Frames are plain tables:
 -- capitalized names that aren't listed below resolve to a no-op method, so any
 -- SetFoo/EnableBar call is accepted; lowercase names are ordinary fields.
 --
@@ -180,8 +180,8 @@ function SetItemRef() end
 ChatFrameUtil = { InsertLink = function(text) return false end }
 function ChatEdit_InsertLink(text) return ChatFrameUtil.InsertLink(text) end
 
--- The character, for the game context (WoWClaude.GameContext).
-function GetBuildInfo() return "1.60.1", "69913", "Sep 1 2026", 16001 end
+-- The character, for the game context (WoWWhatsApp.GameContext).
+function GetBuildInfo() return "12.1.0", "120100", "Sep 1 2026", 120100 end
 function UnitName(unit) if unit == "player" then return "Testchar" end end
 function GetRealmName() return "Test Realm" end
 function UnitLevel(unit) return STUB.level end

@@ -5,6 +5,17 @@ const assert = require('node:assert/strict');
 const path = require('path');
 const os = require('os');
 const P = require('../bridge/protocol');
+const WhatsAppProvider = require('../bridge/whatsapp');
+
+test('WhatsApp media messages use compact safe display labels', async () => {
+  const format = WhatsAppProvider.formatIncomingMessage;
+  assert.equal(await format({}, { type: 'location', body: 'encoded location payload' }), '[L]');
+  assert.equal(await format({}, { type: 'image', caption: 'vacaciones' }), '[P] vacaciones');
+  assert.equal(await format({}, { type: 'contact', body: 'BEGIN:VCARD...' }), '[C]');
+  assert.equal(await format({}, { type: 'sticker', body: 'binary data' }), '[S]');
+  assert.equal(await format({}, { type: 'chat', body: '😀😀' }), '[E]');
+  assert.equal(await format({}, { type: 'unsupported_type', body: 'opaque data' }), '[U]');
+});
 
 test('luaStr escapes everything Lua 5.1 needs', () => {
   assert.equal(P.luaStr('a"b\\c\nd\re\x01'), '"a\\"b\\\\c\\nde\\001"');
@@ -56,7 +67,7 @@ test('systemPrompt wraps the game context and is empty without one', () => {
   assert.equal(P.systemPrompt('  \n '), '');
   assert.equal(P.systemPrompt(undefined), '');
   const s = P.systemPrompt('Game: World of Warcraft: Forever\nCharacter: Testchar, level 23 Hunter');
-  assert.ok(s.includes('wow-claude addon'));
+  assert.ok(s.includes('wow-whatsapp addon'));
   assert.ok(s.includes('\nGame: World of Warcraft: Forever\nCharacter: Testchar, level 23 Hunter\n'));
   assert.ok(s.includes('Linked from the game'));
   assert.ok(!s.includes('Reference for writing addons'), 'no primer section without a primer');
@@ -69,7 +80,7 @@ test('systemPrompt wraps the game context and is empty without one', () => {
 test('the shipped primer exists, mentions the essentials, and stays small enough to send on every run', () => {
   const fs = require('fs');
   const primer = fs.readFileSync(path.join(__dirname, '..', 'docs', 'WOW-ADDON-PRIMER.md'), 'utf8');
-  for (const must of ['## Interface: 16001', 'Gethe/wow-ui-source', 'InCombatLockdown', 'hooksecurefunc', 'SavedVariables', '/reload', '#showtooltip']) {
+  for (const must of ['## Interface: 120100', 'Gethe/wow-ui-source', 'InCombatLockdown', 'hooksecurefunc', 'SavedVariables', '/reload', '#showtooltip']) {
     assert.ok(primer.includes(must), 'primer mentions ' + must);
   }
   assert.ok(primer.length < 9000, `primer is ${primer.length} chars; keep it under 9000 (it costs tokens on every message)`);
@@ -87,11 +98,11 @@ test('jobsFromStrip handles several records per frame and older formats', () => 
 
 test('parseOutbox decodes the SavedVariables fallback', () => {
   const hex = s => Buffer.from(s, 'utf8').toString('hex');
-  const src = `WoWClaudeDB = {\n["outbox"] = {\n["id"] = 7,\n["session"] = "abc123",\n["chat"] = "c1",\n["text"] = "${hex('héllo')}",\n["cwd"] = "${hex('realms')}",\n["newSession"] = true,\n},\n["settings"] = {},\n}`;
+  const src = `WoWWhatsAppDB = {\n["outbox"] = {\n["id"] = 7,\n["session"] = "abc123",\n["chat"] = "c1",\n["text"] = "${hex('héllo')}",\n["cwd"] = "${hex('realms')}",\n["newSession"] = true,\n},\n["settings"] = {},\n}`;
   assert.deepEqual(P.parseOutbox(src), { id: 7, session: 'abc123', chat: 'c1', text: 'héllo', cwd: 'realms', newSession: true, via: 'reload' });
   const withCtx = src.replace('["newSession"]', `["ctx"] = "${hex('Character: Testchar')}",\n["newSession"]`);
   assert.equal(P.parseOutbox(withCtx).ctx, 'Character: Testchar');
-  assert.equal(P.parseOutbox('WoWClaudeDB = {}'), null);
+  assert.equal(P.parseOutbox('WoWWhatsAppDB = {}'), null);
   assert.equal(P.parseOutbox('["outbox"] = { ["text"] = "" }'), null);
 });
 

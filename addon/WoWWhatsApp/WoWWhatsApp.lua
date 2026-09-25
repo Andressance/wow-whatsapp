@@ -1,4 +1,4 @@
--- WoWClaude: talk to local Claude Code sessions from inside WoW, without reloading.
+-- WoWWhatsApp: use WhatsApp chats from inside WoW, without reloading.
 --
 -- The WoW sandbox has no network and no file reads at runtime. Two doors remain open:
 --
@@ -7,27 +7,28 @@
 --        bridge.js screen-captures that corner and decodes it. Nothing touches the game.
 --   IN:  load-on-demand addons read their files from disk at the moment they load.
 --        The bridge writes the latest replies for every chat into a pool of pre-made
---        slot addons (WoWClaude_S001..S200); we load a fresh slot from a timer.
+--        slot addons (WoWWhatsApp_S001..S200); we load a fresh slot from a timer.
 --        Each slot is single-use per session; a /reload frees them all.
 --   Fallback ("reload" mode): SavedVariables + Inbox.lua, a ReloadUI() per step.
 --
--- Chats: each chat is its own Claude session (like a separate terminal) with its own
+-- Chats: each chat is its own WhatsApp session (like a separate terminal) with its own
 -- folder, history and pending message. The bridge runs them in parallel.
 -- Everything here is plain addon API. No automation, no memory reading.
 
 local ADDON_NAME = ...
-local WoWClaude = {}
-_G.WoWClaude = WoWClaude
-local Codec = WoWClaude_Codec
+local WoWWhatsApp = {}
+_G.WoWWhatsApp = WoWWhatsApp
+local Codec = WoWWhatsApp_Codec
 
 local DEFAULT_CWD = "" -- empty = the bridge's configured defaultCwd
 local MAX_HISTORY = 200
 local MAX_CHATS = 16
 
 local SLOT_COUNT = 200
-local SLOT_PREFIX = "WoWClaude_S"
+local SLOT_PREFIX = "WoWWhatsApp_S"
 local ACT_MAX = 60 -- heartbeat files per message (act/NNN/01..60.wav)
 local PRESENCE_MAX = 2000 -- presence/0001..2000.wav, one flipped by the bridge every 30 s
+local INCOMING_MAX = 2000 -- incoming/0001..2000.wav, one flipped per WhatsApp message
 local STRIP_TRIES = 3 -- re-show an unacknowledged message this many times before falling back
 local CELL, CELLS_PER_ROW, MAX_ROWS = 4, 200, 48
 local STRIP_SECONDS = 40 -- max per message; it leaves the strip as soon as the bridge acknowledges
@@ -36,6 +37,7 @@ local POLL_TAIL = 60
 local TICK_SECONDS = 2
 local CONNECT_WAIT = 15 -- seconds the Connect button waits for the bridge before giving up
 local IDLE_POLL_SECONDS = 600 -- without the sound channel, spend one slot this often while idle to check the bridge
+local INCOMING_POLL_SECONDS = 5 -- fallback when the client's sound-file readiness channel is unavailable
 local RS, US = "\30", "\31" -- record / unit separators in the strip payload
 
 local db
@@ -54,7 +56,8 @@ local BACKDROP = {
 
 local ROLE_STYLE = {
 	user   = { label = "You",    color = { 0.49, 0.78, 1.00 }, bg = { 0.25, 0.45, 0.75, 0.16 } },
-	claude = { label = "Claude", color = { 1.00, 0.82, 0.25 }, bg = { 0.85, 0.70, 0.30, 0.10 } },
+	contact = { label = "Contact", color = { 0.35, 0.95, 0.55 }, bg = { 0.20, 0.65, 0.35, 0.12 } },
+	whatsapp = { label = "Contact", color = { 0.35, 0.95, 0.55 }, bg = { 0.20, 0.65, 0.35, 0.12 } },
 	system = { label = "System", color = { 0.62, 0.62, 0.62 }, bg = { 0.50, 0.50, 0.50, 0.10 } },
 }
 
@@ -127,11 +130,20 @@ local function ActiveChat()
 	return FindChat(db.activeChat)
 end
 
-local function AddChat(name, cwd)
+local function IsWhatsAppId(name)
+	return type(name) == "string" and (name:find("@g.us", 1, true) ~= nil or name:find("@c.us", 1, true) ~= nil)
+end
+
+local function IsDefaultChatName(name)
+	return type(name) == "string" and (name == "" or name == "Chat 1" or name == "New chat"
+		or name:match("^Chat %d+$") ~= nil)
+end
+
+local function AddChat(name, cwd, id)
 	if #db.chats >= MAX_CHATS then return nil end
 	local current = ActiveChat()
 	local c = {
-		id = NewId(),
+		id = id or NewId(),
 		name = name or ("Chat " .. (#db.chats + 1)),
 		cwd = cwd or (current and current.cwd) or DEFAULT_CWD,
 		history = {},
@@ -150,13 +162,13 @@ local function AnyPending()
 end
 
 local function InitDB()
-	WoWClaudeDB = WoWClaudeDB or {}
-	db = WoWClaudeDB
+	WoWWhatsAppDB = WoWWhatsAppDB or {}
+	db = WoWWhatsAppDB
 	db.settings = db.settings or {}
 	local s = db.settings
 	if s.autoRefresh == nil then s.autoRefresh = true end
 	if s.signal == nil then s.signal = true end
-	if s.context == nil then s.context = true end -- tell Claude about the character, zone, etc.
+	if s.context == nil then s.context = true end -- tell WhatsApp about the character, zone, etc.
 	s.echo = s.echo or "full" -- how much of each reply to print in the game chat
 	s.mode = s.mode or "pixel"
 	s.interval = s.interval or 20
@@ -192,8 +204,8 @@ local function InitDB()
 	if not FindChat(db.activeChat) then db.activeChat = db.chats[1].id end
 end
 
-local function AddHistory(chat, role, text, id, denied)
-	table.insert(chat.history, { role = role, text = text, id = id, t = time(), denied = denied })
+local function AddHistory(chat, role, text, id, denied, sender, replyTo)
+	table.insert(chat.history, { role = role, text = text, id = id, t = time(), denied = denied, sender = sender, replyTo = replyTo })
 	while #chat.history > MAX_HISTORY do
 		table.remove(chat.history, 1)
 	end
@@ -213,7 +225,7 @@ end
 
 local function SafeReload()
 	if InCombatLockdown() then
-		WoWClaude.reloadAfterCombat = true
+		WoWWhatsApp.reloadAfterCombat = true
 		if ui.status then
 			ui.status:SetText("In combat - will reload as soon as it ends")
 		end
@@ -225,12 +237,12 @@ end
 -- ReloadUI() only works from a hardware event (a keypress or click), never from
 -- a timer. So the automatic reload piggybacks on the player's own next keypress
 -- once the interval has elapsed. The key still reaches the game normally.
-local keyCatcher = CreateFrame("Frame", "WoWClaudeKeyCatcher", UIParent)
+local keyCatcher = CreateFrame("Frame", "WoWWhatsAppKeyCatcher", UIParent)
 keyCatcher:Hide()
 keyCatcher:EnableKeyboard(true)
 keyCatcher:SetScript("OnKeyDown", function(self, key)
 	if db and AnyPending() and db.settings.autoRefresh
-		and GetTime() >= (WoWClaude.nextAutoRefresh or 0)
+		and GetTime() >= (WoWWhatsApp.nextAutoRefresh or 0)
 		and not InCombatLockdown() then
 		self:Hide()
 		ReloadUI()
@@ -239,7 +251,7 @@ end)
 
 -- Arm the keypress reload. In pixel mode this is only used once the slot pool
 -- is exhausted (a reload frees every slot) or the slots are not installed.
-function WoWClaude.ArmAutoRefresh()
+function WoWWhatsApp.ArmAutoRefresh()
 	keyCatcher:Hide()
 	if not AnyPending() or not db.settings.autoRefresh then return end
 	if db.settings.mode == "pixel" and not (run.slotsExhausted or run.slotsMissing or run.pixelFailed) then return end
@@ -250,7 +262,7 @@ function WoWClaude.ArmAutoRefresh()
 		keyCatcher:SetPropagateKeyboardInput(true)
 		keyCatcher.propagates = true
 	end
-	WoWClaude.nextAutoRefresh = GetTime() + db.settings.interval
+	WoWWhatsApp.nextAutoRefresh = GetTime() + db.settings.interval
 	keyCatcher:Show()
 end
 
@@ -263,7 +275,7 @@ local cellPool = {}
 
 local function EnsureStrip()
 	if strip then return strip end
-	strip = CreateFrame("Frame", "WoWClaudeStrip", UIParent)
+	strip = CreateFrame("Frame", "WoWWhatsAppStrip", UIParent)
 	strip:SetFrameStrata("TOOLTIP")
 	strip:SetFrameLevel(10000)
 	-- Scale so that one UI unit is exactly one physical pixel (see Blizzard's PixelUtil).
@@ -376,12 +388,12 @@ end
 
 local function CheckSignal(kind, id)
 	if run.signalUnreliable then return false end
-	return SoundValid(string.format("Interface\\AddOns\\WoWClaude\\%s\\%03d.wav", kind, SlotNumber(id)))
+	return SoundValid(string.format("Interface\\AddOns\\WoWWhatsApp\\%s\\%03d.wav", kind, SlotNumber(id)))
 end
 
 -- Heartbeat: the bridge flips act/NNN/kk.wav for the k-th action of message NNN.
 local function ActPath(id, k)
-	return string.format("Interface\\AddOns\\WoWClaude\\act\\%03d\\%02d.wav", SlotNumber(id), k)
+	return string.format("Interface\\AddOns\\WoWWhatsApp\\act\\%03d\\%02d.wav", SlotNumber(id), k)
 end
 
 local function StartActivity(chat, id)
@@ -418,7 +430,7 @@ local function NotedBridge(at)
 end
 
 local function PresencePath(k)
-	return string.format("Interface\\AddOns\\WoWClaude\\presence\\%04d.wav", k)
+	return string.format("Interface\\AddOns\\WoWWhatsApp\\presence\\%04d.wav", k)
 end
 
 -- Valid presence files form a prefix 1..k, so a binary search finds the head.
@@ -444,6 +456,33 @@ local function PollPresence()
 	end
 end
 
+local function IncomingPath(k)
+	return string.format("Interface\\AddOns\\WoWWhatsApp\\incoming\\%04d.wav", k)
+end
+
+local TryLoadSlot -- defined below
+
+local function FindIncomingHead()
+	local lo, hi = 0, INCOMING_MAX
+	while lo < hi do
+		local mid = math.ceil((lo + hi) / 2)
+		if SoundValid(IncomingPath(mid)) then lo = mid else hi = mid - 1 end
+	end
+	return lo
+end
+
+local function PollIncoming()
+	if not signalAvailable or not db.settings.signal then return end
+	run.incoming = run.incoming or { last = FindIncomingHead() }
+	local p = run.incoming
+	for _ = 1, 3 do
+		local k = (p.last % INCOMING_MAX) + 1
+		if not SoundValid(IncomingPath(k)) then break end
+		p.last = k
+		TryLoadSlot("incoming")
+	end
+end
+
 -- Whether the 30-second presence beats can reach us at all. When they can't
 -- (self-test failed, or signal checks turned off), the only evidence of the
 -- bridge is a slot read: the idle poll below and the replies themselves.
@@ -456,7 +495,7 @@ end
 -- suspicious. Without them the addon only hears from it every IDLE_POLL_SECONDS,
 -- so the windows have to be wider or the light could never stay green between
 -- messages and every reply would be followed by a Reconnect.
-function WoWClaude.BridgeState()
+function WoWWhatsApp.BridgeState()
 	local seen = run.bridgeSeen
 	if not seen then
 		return "unknown", 0.6, 0.6, 0.6, "Bridge: not seen yet this session"
@@ -482,8 +521,8 @@ local STATE_ICON = {
 	unknown = "Interface\\FriendsFrame\\StatusIcon-Offline",
 }
 
-function WoWClaude.UpdateDot()
-	local state, _, _, _, tip = WoWClaude.BridgeState()
+function WoWWhatsApp.UpdateDot()
+	local state, _, _, _, tip = WoWWhatsApp.BridgeState()
 	if run.pixelFailed then state = "down" end
 	if not signalAvailable and signalStats.selftest then
 		tip = tip .. "\n(sound-file channel unavailable: " .. signalStats.selftest .. "; using slot checks only)"
@@ -499,14 +538,14 @@ end
 -- Connected = the bridge has been seen recently. In pixel mode, sending needs this;
 -- until then the Connect button takes the Send button's place. The reload
 -- transport has no idea whether the bridge is there, so it never gates.
-function WoWClaude.IsConnected()
+function WoWWhatsApp.IsConnected()
 	if not db or db.settings.mode ~= "pixel" then return true end
-	return WoWClaude.BridgeState() == "ok" and not run.pixelFailed
+	return WoWWhatsApp.BridgeState() == "ok" and not run.pixelFailed
 end
 
 -- Connect button: say hello to the bridge (it acks, refreshes the slots and
 -- offers a restore), ignoring SayHello's throttle so a click always does something.
-function WoWClaude.Connect()
+function WoWWhatsApp.Connect()
 	if db.settings.mode ~= "pixel" then
 		SafeReload()
 		return
@@ -515,22 +554,22 @@ function WoWClaude.Connect()
 	run.pixelFailed = nil
 	run.connectFailed = nil
 	run.connectingAt = GetTime()
-	WoWClaude.SayHello()
+	WoWWhatsApp.SayHello()
 end
 
 -- One word for the connection state, so Tick can tell when it changed.
 local function ConnectionKey()
-	if WoWClaude.IsConnected() then return "ok" end
+	if WoWWhatsApp.IsConnected() then return "ok" end
 	if run.connectingAt then return "connecting" end
 	if run.connectFailed then return "failed" end
-	return WoWClaude.BridgeState()
+	return WoWWhatsApp.BridgeState()
 end
 
 -- Called every tick: time out a Connect attempt, and redraw when the state flips
 -- (light, button, status line, placeholder) without redrawing every tick.
-function WoWClaude.CheckConnection()
+function WoWWhatsApp.CheckConnection()
 	if run.connectingAt then
-		if WoWClaude.IsConnected() then
+		if WoWWhatsApp.IsConnected() then
 			run.connectingAt, run.connectFailed = nil, nil
 			-- A message typed while disconnected goes out now, without a second click,
 			-- as long as the same chat is still in front and free.
@@ -539,26 +578,26 @@ function WoWClaude.CheckConnection()
 			local c = queued and ActiveChat()
 			if c and c.id == queued.chat and not c.pendingId then
 				if ui.input and Trim(ui.input:GetText() or "") == queued.text then ui.input:SetText("") end
-				WoWClaude.Send(queued.text, queued.allow)
+				WoWWhatsApp.Send(queued.text, queued.allow)
 			end
 		elseif GetTime() - run.connectingAt > CONNECT_WAIT then
 			run.connectingAt, run.connectFailed = nil, true
 			run.sendOnConnect = nil -- the text is still in the box
 		end
-	elseif run.connectFailed and WoWClaude.IsConnected() then
+	elseif run.connectFailed and WoWWhatsApp.IsConnected() then
 		run.connectFailed = nil
 	end
 	local key = ConnectionKey()
 	if key ~= run.connKey then
 		run.connKey = key
-		WoWClaude.Render()
+		WoWWhatsApp.Render()
 	end
 end
 
 -- Swap Send and Connect depending on the state; part of UpdateStatus.
-function WoWClaude.UpdateConnect()
+function WoWWhatsApp.UpdateConnect()
 	if not ui.connect or not ui.send then return end
-	local connected = WoWClaude.IsConnected()
+	local connected = WoWWhatsApp.IsConnected()
 	ui.send:SetShown(connected)
 	ui.connect:SetShown(not connected)
 	if connected then return end
@@ -566,7 +605,7 @@ function WoWClaude.UpdateConnect()
 		ui.connect:SetText("Connecting...")
 		ui.connect:Disable()
 	else
-		ui.connect:SetText(WoWClaude.BridgeState() == "stale" and "Reconnect" or "Connect")
+		ui.connect:SetText(WoWWhatsApp.BridgeState() == "stale" and "Reconnect" or "Connect")
 		ui.connect:Enable()
 	end
 end
@@ -578,8 +617,8 @@ local function SelfTestSignals()
 		signalStats.selftest = "PlaySoundFile missing"
 		return
 	end
-	local emptyLooksValid = SoundValid("Interface\\AddOns\\WoWClaude\\ctl\\empty.wav")
-	local validLooksValid = SoundValid("Interface\\AddOns\\WoWClaude\\ctl\\valid.wav")
+	local emptyLooksValid = SoundValid("Interface\\AddOns\\WoWWhatsApp\\ctl\\empty.wav")
+	local validLooksValid = SoundValid("Interface\\AddOns\\WoWWhatsApp\\ctl\\valid.wav")
 	if emptyLooksValid then
 		signalAvailable = false
 		signalStats.selftest = "an empty file reports as playable"
@@ -601,7 +640,7 @@ local function ActivityLine(chat)
 		if a.last then
 			local quiet = now - a.last
 			s = s .. ", last " .. FmtDur(quiet) .. " ago"
-			if quiet > 120 then s = s .. " (quiet for a while - stuck? /wow-claude cancel)" end
+			if quiet > 120 then s = s .. " (quiet for a while - stuck? /wow-whatsapp cancel)" end
 		elseif now - started > 60 then
 			s = s .. ", no activity seen yet"
 		end
@@ -628,6 +667,7 @@ local function ScheduleNextPoll()
 end
 
 local Finish -- defined below
+local NotifyWhatsApp -- defined in the chat notification section
 
 -- The bridge has read this record: whatever game context rode on it is now
 -- what the bridge knows, so later messages only carry it again if it changes.
@@ -650,12 +690,43 @@ local function ApplyReplies(replies)
 	local matched = false
 	for _, r in ipairs(replies or {}) do
 		local c = FindChat(r.chat)
-		if c and c.pendingId and r.id == c.pendingId then
+		if r.status == "incoming" and r.chat and r.text then
+			if not c then
+				c = AddChat(r.chatName or r.name or r.chat, "", r.chat)
+				if c then c.remoteName = r.chatName or r.name or r.chat end
+			end
+			if c then
+				local remoteName = r.chatName or r.name
+				if remoteName and remoteName ~= "" and not c.customName
+					and (not c.name or c.name == c.remoteName or IsWhatsAppId(c.name)
+						or IsDefaultChatName(c.name)) then
+					c.name = remoteName
+					c.remoteName = remoteName
+				end
+				if r.isGroup ~= nil then c.isGroup = r.isGroup end
+				local duplicate = false
+				for _, message in ipairs(c.history) do
+					if message.id == r.id and message.role == "contact" then duplicate = true break end
+				end
+				if not duplicate then
+					AddHistory(c, "contact", r.text, r.id, nil, r.sender, r.replyTo)
+					if db.activeChat ~= c.id then c.unread = (c.unread or 0) + 1 end
+					NotifyWhatsApp(c, r.text, c.isGroup and r.sender or nil)
+				end
+				matched = true
+			end
+		elseif r.status == "sent" and c and c.pendingId and r.id == c.pendingId then
+			matched = true
+			MarkAcked(r.id)
+			c.pendingId = nil
+			c.progress = nil
+			WoWWhatsApp.Render()
+		elseif c and c.pendingId and r.id == c.pendingId then
 			matched = true
 			MarkAcked(r.id)
 			local denied = type(r.denied) == "table" and #r.denied > 0 and r.denied or nil
 			if r.status == "done" then
-				Finish(c, "claude", r.text or "", denied)
+				Finish(c, "whatsapp", r.text or "", denied)
 			elseif r.status == "error" then
 				Finish(c, "system", "Bridge error: " .. tostring(r.text), denied)
 			elseif r.status == "working" then
@@ -685,7 +756,7 @@ local function ImportRestore(r)
 				created = time(),
 			}
 			for _, m in ipairs(rc.messages or {}) do
-				table.insert(chat.history, { role = m.role, text = m.text, id = m.id, t = m.t })
+				table.insert(chat.history, { role = m.role, text = m.text, id = m.id, t = m.t, sender = m.sender, replyTo = m.replyTo })
 			end
 			-- Keep the chat we're currently using last so it stays where it was.
 			table.insert(db.chats, math.max(1, #db.chats), chat)
@@ -700,32 +771,32 @@ local function ImportRestore(r)
 			end
 		end
 		AddHistory(current, "system", "Restored " .. added .. " chat(s) from the bridge after the game reset the saved data.")
-		WoWClaude.RenderChatList()
+		WoWWhatsApp.RenderChatList()
 	end
 end
 
-local function TryLoadSlot(why)
+TryLoadSlot = function(why)
 	local name = FreeSlot()
 	if not name then
 		run.slotsExhausted = true
-		WoWClaude.ArmAutoRefresh()
-		WoWClaude.UpdateStatus()
+		WoWWhatsApp.ArmAutoRefresh()
+		WoWWhatsApp.UpdateStatus()
 		return
 	end
-	WoWClaude_SlotData = nil
+	WoWWhatsApp_SlotData = nil
 	local loaded, reason = C_AddOns.LoadAddOn(name)
 	if not loaded then
 		run.slotError = reason
 		if reason == "MISSING" or reason == "DISABLED" then
 			run.slotsMissing = true
-			WoWClaude.ArmAutoRefresh()
+			WoWWhatsApp.ArmAutoRefresh()
 		end
-		WoWClaude.UpdateStatus()
+		WoWWhatsApp.UpdateStatus()
 		return
 	end
 	run.polls = (run.polls or 0) + 1
 	ScheduleNextPoll()
-	local data = WoWClaude_SlotData
+	local data = WoWWhatsApp_SlotData
 	if type(data) == "table" and type(data.now) == "number" then
 		-- The bridge's clock and ours are the same machine; translate to GetTime().
 		NotedBridge(GetTime() - (time() - data.now))
@@ -736,23 +807,25 @@ local function TryLoadSlot(why)
 	if why == "signal" and not matched then
 		run.signalUnreliable = true
 	end
-	WoWClaude.Render()
+	WoWWhatsApp.Render()
 end
 
 local function Tick()
 	if not db then return end
 	local now = GetTime()
 	PollPresence()
+	PollIncoming()
 	-- Without presence beats, the only evidence is a slot read; spend one every
 	-- IDLE_POLL_SECONDS while idle so the light still reflects reality (and stays
 	-- green while the bridge is up: BridgeState allows for this interval).
 	if not PresenceWorks() and db.settings.mode == "pixel" and not AnyPending()
 		and now - (run.lastIdlePoll or -1e9) >= IDLE_POLL_SECONDS then
 		run.lastIdlePoll = now
+		run.lastIncomingPoll = now
 		TryLoadSlot("idle")
 	end
-	WoWClaude.UpdateDot()
-	WoWClaude.CheckConnection()
+	WoWWhatsApp.UpdateDot()
+	WoWWhatsApp.CheckConnection()
 	if db.settings.mode ~= "pixel" then return end
 	local changed = false
 	if run.helloPollAt and now >= run.helloPollAt then
@@ -761,12 +834,12 @@ local function Tick()
 		-- Whatever that slot held, the wait is over.
 		if run.restoring then
 			run.restoring = nil
-			WoWClaude.Render()
+			WoWWhatsApp.Render()
 		end
 	end
 	if run.restoring and now - run.restoring > 25 then
 		run.restoring = nil
-		WoWClaude.Render()
+		WoWWhatsApp.Render()
 	end
 	for id, rec in pairs(run.outbound) do
 		if not rec.acked and CheckSignal("ack", id) then
@@ -803,20 +876,27 @@ local function Tick()
 				run.outbound[id] = nil
 				run.pixelFailed = true
 				changed = true
-				WoWClaude.ArmAutoRefresh()
+				WoWWhatsApp.ArmAutoRefresh()
 			end
 		end
 	end
 	if changed then
 		RefreshStrip()
-		WoWClaude.UpdateStatus()
+		WoWWhatsApp.UpdateStatus()
 	end
-	if not AnyPending() then return end
+	if not AnyPending() then
+		if db.settings.mode == "pixel" and not PresenceWorks()
+			and now - (run.lastIncomingPoll or -1e9) >= INCOMING_POLL_SECONDS then
+			run.lastIncomingPoll = now
+			TryLoadSlot("incoming-poll")
+		end
+		return
+	end
 	local moved = false
 	for _, c in ipairs(db.chats) do
 		if c.pendingId and PollActivity(c) then moved = true end
 	end
-	if moved then WoWClaude.Render() end
+	if moved then WoWWhatsApp.Render() end
 	for _, c in ipairs(db.chats) do
 		if c.pendingId and CheckSignal("sig", c.pendingId) then
 			TryLoadSlot("signal")
@@ -830,7 +910,7 @@ end
 
 -- Pull whatever bridge.js last wrote into Inbox.lua (the reload path).
 local function ProcessInbox()
-	local inbox = WoWClaude_Inbox
+	local inbox = WoWWhatsApp_Inbox
 	if type(inbox) ~= "table" then return end
 	if type(inbox.cwd) == "string" and inbox.cwd ~= "" then run.bridgeCwd = inbox.cwd end
 	ApplyReplies(inbox.replies)
@@ -854,19 +934,19 @@ Finish = function(chat, role, text, denied)
 		ui.input:SetText(chat.draft)
 		chat.draft = nil
 	end
-	WoWClaude.Render()
-	WoWClaude.Notify(chat, text)
+	WoWWhatsApp.Render()
+	WoWWhatsApp.Notify(chat, text)
 end
 
 ---------------------------------------------------------------------------
 -- Game context and links
 ---------------------------------------------------------------------------
 
--- Claude only sees text, so two things about the game are spelled out for it:
+-- WhatsApp only sees text, so two things about the game are spelled out for it:
 -- who is asking (the character, where they are; sent with the hello and again
--- when it changes, and put into Claude's system prompt by the bridge), and
+-- when it changes, and put into WhatsApp's system prompt by the bridge), and
 -- what the player shift-clicked into the message (item, spell and quest links
--- are meaningless markup to Claude; their tooltips are what the player sees).
+-- are meaningless markup to WhatsApp; their tooltips are what the player sees).
 -- Every game API here is optional: whatever the client lacks is left out.
 
 local CONTEXT_MAX = 700 -- bytes of context per record; the strip has ~3.2 KB for everything
@@ -888,13 +968,13 @@ local function Money(copper)
 	return c .. "c"
 end
 
--- A few lines about the game and the character, as the bridge will show them to Claude.
-function WoWClaude.GameContext()
+-- A few lines about the game and the character, as the bridge will show them to WhatsApp.
+function WoWWhatsApp.GameContext()
 	local lines = {}
 	local version, build, _, toc = Try(GetBuildInfo)
 	toc = tonumber(toc)
 	local game = "World of Warcraft"
-	if toc and toc >= 16000 and toc < 20000 then game = "World of Warcraft: Forever" end
+	if toc and ((toc >= 16000 and toc < 20000) or toc >= 120000) then game = "World of Warcraft: Forever" end
 	local client = ""
 	if version then
 		client = " (client " .. tostring(version) .. (build and ("." .. tostring(build)) or "") .. (toc and (", interface " .. toc) or "") .. ")"
@@ -994,7 +1074,7 @@ end
 -- it (or it wouldn't fit next to this message; it goes with a later one).
 -- "" when the setting is off, so the bridge drops what it had.
 local function ContextToSend(room)
-	local ctx = db.settings.context and WoWClaude.GameContext() or ""
+	local ctx = db.settings.context and WoWWhatsApp.GameContext() or ""
 	if ctx == (run.contextSent or "") then return nil end
 	if room and #ctx > room then return nil end
 	return ctx
@@ -1004,15 +1084,15 @@ end
 local scanTip
 local function TooltipLines(payload)
 	if not scanTip then
-		scanTip = CreateFrame("GameTooltip", "WoWClaudeScanTip", UIParent, "GameTooltipTemplate")
+		scanTip = CreateFrame("GameTooltip", "WoWWhatsAppScanTip", UIParent, "GameTooltipTemplate")
 	end
 	scanTip:SetOwner(UIParent, "ANCHOR_NONE")
 	scanTip:ClearLines()
 	local lines = {}
 	if pcall(scanTip.SetHyperlink, scanTip, payload) then
 		for i = 1, math.min(scanTip:NumLines() or 0, LINK_LINES_MAX) do
-			local left = _G["WoWClaudeScanTipTextLeft" .. i]
-			local right = _G["WoWClaudeScanTipTextRight" .. i]
+			local left = _G["WoWWhatsAppScanTipTextLeft" .. i]
+			local right = _G["WoWWhatsAppScanTipTextRight" .. i]
 			local l = Trim(tostring((left and left:GetText()) or ""))
 			local r = Trim(tostring((right and right:IsShown() and right:GetText()) or ""))
 			if r ~= "" then l = l .. "  " .. r end
@@ -1036,10 +1116,10 @@ local function DescribeLink(payload)
 	return s
 end
 
--- Turn the links in a message into text Claude can use: each becomes [Name]
+-- Turn the links in a message into text WhatsApp can use: each becomes [Name]
 -- in place, and a block at the end lists what the tooltip says about it.
 -- Returns the new text and the number of links found.
-function WoWClaude.ExpandLinks(text)
+function WoWWhatsApp.ExpandLinks(text)
 	local links, seen = {}, {}
 	local function Take(payload, name)
 		if not seen[payload] then
@@ -1068,7 +1148,7 @@ end
 ---------------------------------------------------------------------------
 
 -- allow: optional list of permission rules to grant before this message runs.
-function WoWClaude.Send(text, allow)
+function WoWWhatsApp.Send(text, allow)
 	local c = ActiveChat()
 	if not c then return end
 	text = Trim(text or "")
@@ -1083,23 +1163,23 @@ function WoWClaude.Send(text, allow)
 		return
 	end
 	if text == "" then return end
-	if not WoWClaude.IsConnected() then
+	if not WoWWhatsApp.IsConnected() then
 		-- Not connected: the message stays in the box and we try to connect;
 		-- CheckConnection sends it the moment the light turns green. If the bridge
 		-- never answers, the text is still in the box for a later try.
 		if ui.input then ui.input:SetText(text) end
 		run.sendOnConnect = { chat = c.id, text = text, allow = allow }
-		if not run.connectingAt then WoWClaude.Connect() end
-		WoWClaude.Toggle(true)
+		if not run.connectingAt then WoWWhatsApp.Connect() end
+		WoWWhatsApp.Toggle(true)
 		return
 	end
-	-- Shift-clicked links become [Name] plus their tooltip, which is what Claude can read.
+	-- Shift-clicked links become [Name] plus their tooltip, which is what WhatsApp can read.
 	local links
-	text, links = WoWClaude.ExpandLinks(text)
+	text, links = WoWWhatsApp.ExpandLinks(text)
 	local limit = Codec.MAX_PAYLOAD - 300
 	if #text > limit then
 		AddHistory(c, "system", "That message is too long for one send (" .. #text .. " chars, max ~" .. limit .. "). Split it up." .. (links > 0 and " Each linked item adds its tooltip to the message." or ""))
-		WoWClaude.Render()
+		WoWWhatsApp.Render()
 		return
 	end
 	-- The game context rides along when the bridge doesn't have this version yet.
@@ -1128,7 +1208,7 @@ function WoWClaude.Send(text, allow)
 	c.progress = nil
 	AddHistory(c, "user", text, id)
 	-- A chat still carrying its default name takes its title from the first message
-	-- you send (system notes like "/wow-claude cd" before it don't count).
+	-- you send (system notes like "/wow-whatsapp cd" before it don't count).
 	if c.name:match("^Chat %d+$") then
 		local first = true
 		for _, m in ipairs(c.history) do
@@ -1145,7 +1225,7 @@ function WoWClaude.Send(text, allow)
 		StartActivity(c, id)
 		ScheduleNextPoll()
 		RefreshStrip()
-		WoWClaude.Render()
+		WoWWhatsApp.Render()
 	else
 		SafeReload()
 	end
@@ -1153,7 +1233,7 @@ end
 
 -- Forget: a record with no text telling the bridge a chat was deleted, so it drops
 -- the transcript (which a later restore would otherwise bring back) and the
--- Claude session. db.forget keeps the id until the bridge acks, so a delete made
+-- WhatsApp session. db.forget keeps the id until the bridge acks, so a delete made
 -- while the bridge was away is sent again with the next hello.
 local function SendForget(chatId)
 	if db.settings.mode ~= "pixel" then return end
@@ -1177,14 +1257,14 @@ end
 -- so the status light and any lost chats come back before the first message.
 -- The game context always rides on it (empty when turned off), so the bridge's
 -- copy is brought in line at every login and Connect.
-function WoWClaude.SayHello()
+function WoWWhatsApp.SayHello()
 	if db.settings.mode ~= "pixel" then return end
 	local now = GetTime()
 	if run.lastHelloAt and now - run.lastHelloAt < 60 then return end
 	run.lastHelloAt = now
 	db.lastSeq = db.lastSeq + 1
 	local c = ActiveChat()
-	local ctx = db.settings.context and WoWClaude.GameContext() or ""
+	local ctx = db.settings.context and WoWWhatsApp.GameContext() or ""
 	run.outbound[db.lastSeq] = { chat = c and c.id or "", cwd = c and c.cwd or "", flags = "h", name = c and c.name or "", text = "", ctx = ctx, sentAt = now, hello = true }
 	run.helloPollAt = now + 5
 	-- Deletions the bridge never confirmed ride along with the hello.
@@ -1198,11 +1278,11 @@ function WoWClaude.SayHello()
 		if empty then run.restoring = now end
 	end
 	RefreshStrip()
-	WoWClaude.Render()
+	WoWWhatsApp.Render()
 end
 
 -- Put the active chat's pending message back on the strip.
-function WoWClaude.Resend()
+function WoWWhatsApp.Resend()
 	local c = ActiveChat()
 	if not c or not c.pendingId then return end
 	local text
@@ -1218,32 +1298,32 @@ function WoWClaude.Resend()
 	run.polls = 0
 	ScheduleNextPoll()
 	RefreshStrip()
-	WoWClaude.UpdateStatus()
+	WoWWhatsApp.UpdateStatus()
 end
 
-function WoWClaude.SendFromInput()
+function WoWWhatsApp.SendFromInput()
 	if not ui.input then return end
 	local text = ui.input:GetText()
 	ui.input:SetText("")
 	ui.input:ClearFocus() -- hand the keyboard back to the game after sending
-	WoWClaude.Send(text)
+	WoWWhatsApp.Send(text)
 end
 
--- The Allow button: grant the rules a reply asked for, then tell Claude to carry on.
-function WoWClaude.Allow(chatId, rules)
+-- The Allow button: grant the rules a reply asked for, then tell WhatsApp to carry on.
+function WoWWhatsApp.Allow(chatId, rules)
 	local c = FindChat(chatId)
 	if not c or c.pendingId or not rules or #rules == 0 then return end
-	if db.activeChat ~= c.id then WoWClaude.SwitchChat(c.id) end
+	if db.activeChat ~= c.id then WoWWhatsApp.SwitchChat(c.id) end
 	for _, m in ipairs(c.history) do m.denied = nil end
 	AddHistory(c, "system", "Allowed: " .. table.concat(rules, ", "))
-	WoWClaude.Send("Those actions are allowed now. Continue from where you left off.", rules)
+	WoWWhatsApp.Send("Those actions are allowed now. Continue from where you left off.", rules)
 end
 
 ---------------------------------------------------------------------------
 -- Chats
 ---------------------------------------------------------------------------
 
-function WoWClaude.SwitchChat(id)
+function WoWWhatsApp.SwitchChat(id)
 	local c = FindChat(id)
 	if not c then return end
 	local prev = ActiveChat()
@@ -1257,25 +1337,25 @@ function WoWClaude.SwitchChat(id)
 		ui.input:SetText(c.draft or "")
 		c.draft = nil
 	end
-	WoWClaude.Render()
-	WoWClaude.RenderChatList()
+	WoWWhatsApp.Render()
+	WoWWhatsApp.RenderChatList()
 end
 
-function WoWClaude.NewChat(name)
+function WoWWhatsApp.NewChat(name)
 	local c = AddChat(name and name ~= "" and name or nil)
 	if not c then
 		local a = ActiveChat()
-		AddHistory(a, "system", "Chat limit reached (" .. MAX_CHATS .. "). Delete one first with /wow-claude delete.")
-		WoWClaude.Render()
+		AddHistory(a, "system", "Chat limit reached (" .. MAX_CHATS .. "). Delete one first with /wow-whatsapp delete.")
+		WoWWhatsApp.Render()
 		return
 	end
-	WoWClaude.SwitchChat(c.id)
-	WoWClaude.Toggle(true)
+	WoWWhatsApp.SwitchChat(c.id)
+	WoWWhatsApp.Toggle(true)
 end
 
--- Folder this chat's Claude works in. Empty (or "-" / "default") = the bridge's
+-- Folder this chat's WhatsApp works in. Empty (or "-" / "default") = the bridge's
 -- default. Relative paths are resolved by the bridge against that default.
-function WoWClaude.SetFolder(rest, c)
+function WoWWhatsApp.SetFolder(rest, c)
 	c = c or ActiveChat()
 	if not c then return end
 	rest = Trim(rest or "")
@@ -1286,18 +1366,18 @@ function WoWClaude.SetFolder(rest, c)
 		c.cwd = rest
 		local absolute = rest:match("^%a:[\\/]") or rest:match("^[\\/~]")
 		local note = absolute and "" or (" (relative to " .. base .. ")")
-		AddHistory(c, "system", "cwd set to " .. rest .. note .. (changed and #c.history > 1 and "; the next message starts a fresh Claude session there" or ""))
+		AddHistory(c, "system", "cwd set to " .. rest .. note .. (changed and #c.history > 1 and "; the next message starts a fresh WhatsApp session there" or ""))
 	elseif c.cwd ~= "" then
 		c.cwd = ""
 		AddHistory(c, "system", "cwd reset to the bridge's default: " .. base)
 	else
-		AddHistory(c, "system", "cwd is the bridge's default: " .. base .. " (/wow-claude cd <folder>, or right-click the chat and pick Folder, to change)")
+		AddHistory(c, "system", "cwd is the bridge's default: " .. base .. " (/wow-whatsapp cd <folder>, or right-click the chat and pick Folder, to change)")
 	end
-	WoWClaude.Render()
+	WoWWhatsApp.Render()
 end
 
-StaticPopupDialogs["WOWCLAUDE_FOLDER"] = {
-	text = "Folder for this chat\n\nRelative to the bridge's folder (%s), ~, or a full path.\nEmpty = the bridge's default. Changing it starts a fresh Claude session.",
+StaticPopupDialogs["WOWWHATSAPP_FOLDER"] = {
+	text = "Folder for this chat\n\nRelative to the bridge's folder (%s), ~, or a full path.\nEmpty = the bridge's default. Changing it starts a fresh WhatsApp session.",
 	button1 = OKAY,
 	button2 = CANCEL,
 	hasEditBox = 1,
@@ -1317,11 +1397,11 @@ StaticPopupDialogs["WOWCLAUDE_FOLDER"] = {
 	OnAccept = function(dialog, data)
 		local box = dialog.GetEditBox and dialog:GetEditBox() or dialog.editBox
 		local chat = data and FindChat(data.id)
-		if chat and box then WoWClaude.SetFolder(box:GetText(), chat) end
+		if chat and box then WoWWhatsApp.SetFolder(box:GetText(), chat) end
 	end,
 	EditBoxOnEnterPressed = function(box)
 		local dialog = box:GetParent()
-		StaticPopupDialogs["WOWCLAUDE_FOLDER"].OnAccept(dialog, dialog.data)
+		StaticPopupDialogs["WOWWHATSAPP_FOLDER"].OnAccept(dialog, dialog.data)
 		dialog:Hide()
 	end,
 	EditBoxOnEscapePressed = function(box)
@@ -1330,13 +1410,13 @@ StaticPopupDialogs["WOWCLAUDE_FOLDER"] = {
 }
 
 -- Folder dialog for a chat (the active one when no id is given).
-function WoWClaude.FolderPrompt(id)
+function WoWWhatsApp.FolderPrompt(id)
 	local c = (id and FindChat(id)) or ActiveChat()
 	if not c then return end
-	StaticPopup_Show("WOWCLAUDE_FOLDER", run.bridgeCwd or "unknown until connected", nil, { id = c.id, cwd = c.cwd })
+	StaticPopup_Show("WOWWHATSAPP_FOLDER", run.bridgeCwd or "unknown until connected", nil, { id = c.id, cwd = c.cwd })
 end
 
-StaticPopupDialogs["WOWCLAUDE_RENAME"] = {
+StaticPopupDialogs["WOWWHATSAPP_RENAME"] = {
 	text = "Rename this chat",
 	button1 = OKAY,
 	button2 = CANCEL,
@@ -1359,12 +1439,13 @@ StaticPopupDialogs["WOWCLAUDE_RENAME"] = {
 		local name = box and Trim(box:GetText() or "") or ""
 		if chat and name ~= "" then
 			chat.name = name:sub(1, 24)
-			WoWClaude.Render()
+			chat.customName = true
+			WoWWhatsApp.Render()
 		end
 	end,
 	EditBoxOnEnterPressed = function(box)
 		local dialog = box:GetParent()
-		StaticPopupDialogs["WOWCLAUDE_RENAME"].OnAccept(dialog, dialog.data)
+		StaticPopupDialogs["WOWWHATSAPP_RENAME"].OnAccept(dialog, dialog.data)
 		dialog:Hide()
 	end,
 	EditBoxOnEscapePressed = function(box)
@@ -1373,17 +1454,17 @@ StaticPopupDialogs["WOWCLAUDE_RENAME"] = {
 }
 
 -- Rename dialog for a chat (the active one when no id is given).
-function WoWClaude.RenamePrompt(id)
+function WoWWhatsApp.RenamePrompt(id)
 	local c = (id and FindChat(id)) or ActiveChat()
 	if not c then return end
-	StaticPopup_Show("WOWCLAUDE_RENAME", nil, nil, { id = c.id, name = c.name })
+	StaticPopup_Show("WOWWHATSAPP_RENAME", nil, nil, { id = c.id, name = c.name })
 end
-WoWClaude.RenameActive = WoWClaude.RenamePrompt
+WoWWhatsApp.RenameActive = WoWWhatsApp.RenamePrompt
 
 -- Delete a chat (the active one when no id is given). The last chat is cleared
 -- and renamed instead of removed, so there is always one to type into. Either
 -- way the bridge is told to forget it, so a restore won't bring it back.
-function WoWClaude.DeleteChat(id)
+function WoWWhatsApp.DeleteChat(id)
 	local c, idx = nil, nil
 	if id then c, idx = FindChat(id) end
 	if not c then c, idx = ActiveChat() end
@@ -1393,20 +1474,20 @@ function WoWClaude.DeleteChat(id)
 		wipe(c.history)
 		c.pendingId, c.progress, c.unread, c.draft = nil, nil, 0, nil
 		c.name = "Chat 1"
-		WoWClaude.Render()
-		WoWClaude.RenderChatList()
+		WoWWhatsApp.Render()
+		WoWWhatsApp.RenderChatList()
 		return
 	end
 	table.remove(db.chats, idx)
 	if db.activeChat == c.id then
-		WoWClaude.SwitchChat(db.chats[math.min(idx, #db.chats)].id)
+		WoWWhatsApp.SwitchChat(db.chats[math.min(idx, #db.chats)].id)
 	else
-		WoWClaude.RenderChatList()
+		WoWWhatsApp.RenderChatList()
 	end
 end
 
--- The trash can on a chat row asks first; /wow-claude delete does not.
-StaticPopupDialogs["WOWCLAUDE_DELETE"] = {
+-- The trash can on a chat row asks first; /wow-whatsapp delete does not.
+StaticPopupDialogs["WOWWHATSAPP_DELETE"] = {
 	text = "Delete chat \"%s\"?\n\nIts transcript goes away (the last chat is cleared instead of removed).",
 	button1 = OKAY,
 	button2 = CANCEL,
@@ -1414,21 +1495,21 @@ StaticPopupDialogs["WOWCLAUDE_DELETE"] = {
 	whileDead = true,
 	hideOnEscape = true,
 	OnAccept = function(dialog, data)
-		if data then WoWClaude.DeleteChat(data.id) end
+		if data then WoWWhatsApp.DeleteChat(data.id) end
 	end,
 }
 
-function WoWClaude.ConfirmDelete(id)
+function WoWWhatsApp.ConfirmDelete(id)
 	local c = (id and FindChat(id)) or ActiveChat()
 	if not c then return end
-	StaticPopup_Show("WOWCLAUDE_DELETE", Display(c.name), nil, { id = c.id })
+	StaticPopup_Show("WOWWHATSAPP_DELETE", Display(c.name), nil, { id = c.id })
 end
 
 ---------------------------------------------------------------------------
 -- Rendering
 ---------------------------------------------------------------------------
 
-function WoWClaude.UpdateStatus()
+function WoWWhatsApp.UpdateStatus()
 	if not ui.status then return end
 	local c = ActiveChat()
 	local mode = db.settings.mode
@@ -1443,17 +1524,17 @@ function WoWClaude.UpdateStatus()
 			elseif run.slotsExhausted then
 				s = "Slot pool used up this session - next keypress reloads to free it"
 			elseif run.pixelFailed then
-				s = "Bridge didn't see #" .. id .. " after " .. STRIP_TRIES .. " tries - next keypress switches to the reload path (or /wow-claude reload)"
+				s = "Bridge didn't see #" .. id .. " after " .. STRIP_TRIES .. " tries - next keypress switches to the reload path (or /wow-whatsapp reload)"
 			elseif c.progress or (run.act and run.act[c.id] and run.act[c.id].count > 0) then
-				s = "Claude is working on #" .. id .. " - " .. ActivityLine(c)
+				s = "WhatsApp is working on #" .. id .. " - " .. ActivityLine(c)
 			elseif rec and not rec.acked then
 				s = "Sending #" .. id .. (rec.tries and rec.tries > 1 and (" (try " .. rec.tries .. "/" .. STRIP_TRIES .. ")") or "") .. "..."
-				local state = WoWClaude.BridgeState()
+				local state = WoWWhatsApp.BridgeState()
 				if state == "down" then s = s .. " - bridge not seen lately, is the bridge running?" end
 			else
 				s = "Waiting for #" .. id .. " (checked " .. (run.polls or 0) .. "x)"
 				if elapsed > 45 then
-					s = s .. " - no sign of the bridge. Is the bridge running? /wow-claude resend"
+					s = s .. " - no sign of the bridge. Is the bridge running? /wow-whatsapp resend"
 				end
 			end
 		else
@@ -1462,14 +1543,14 @@ function WoWClaude.UpdateStatus()
 				s = s .. "; auto on next keypress after " .. db.settings.interval .. "s"
 			end
 		end
-	elseif not WoWClaude.IsConnected() then
+	elseif not WoWWhatsApp.IsConnected() then
 		if run.connectingAt and run.sendOnConnect then
 			s = "Connecting to the bridge... your message goes out as soon as it answers"
 		elseif run.connectingAt then
 			s = "Connecting to the bridge..."
 		elseif run.connectFailed then
 			s = "No answer from the bridge. Is it running (npm start)? Connect tries again"
-		elseif WoWClaude.BridgeState() == "stale" then
+		elseif WoWWhatsApp.BridgeState() == "stale" then
 			s = "Bridge not seen for a while - click Reconnect"
 		else
 			s = "Not connected - start the bridge, then click Connect"
@@ -1483,10 +1564,10 @@ function WoWClaude.UpdateStatus()
 	end
 	ui.status:SetText(s)
 	run.statusText = s
-	WoWClaude.UpdateDot()
-	WoWClaude.UpdateConnect()
+	WoWWhatsApp.UpdateDot()
+	WoWWhatsApp.UpdateConnect()
 	if ui.title then
-		local t = c and Display(c.name) or "Claude"
+		local t = c and Display(c.name) or "WhatsApp"
 		local folder = FolderName(ChatFolder(c))
 		if folder ~= "" then t = t .. "  |cff888888" .. Display(folder) .. "|r" end
 		ui.title:SetText(t)
@@ -1502,7 +1583,7 @@ function WoWClaude.UpdateStatus()
 	ui.cwd:SetText("cwd: " .. cwdText .. "   mode: " .. mode)
 	if ui.resend then ui.resend:SetShown(c and c.pendingId ~= nil and mode == "pixel") end
 	if ui.refresh then ui.refresh:SetShown(mode ~= "pixel" or run.slotsExhausted or run.slotsMissing or run.pixelFailed or false) end
-	WoWClaude.UpdateMini()
+	WoWWhatsApp.UpdateMini()
 end
 
 -- One message bubble: accent bar, colored label, timestamp, wrapped body.
@@ -1519,48 +1600,62 @@ local function GetBubble(i)
 	b.who = b:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 	b.who:SetPoint("TOPLEFT", b, "TOPLEFT", 10, -6)
 	b.who:SetJustifyH("LEFT")
-	b.when = b:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-	b.when:SetPoint("TOPRIGHT", b, "TOPRIGHT", -8, -6)
 	b.body = b:CreateFontString(nil, "OVERLAY", "ChatFontNormal")
 	b.body:SetPoint("TOPLEFT", b.who, "BOTTOMLEFT", 0, -4)
 	b.body:SetJustifyH("LEFT")
 	b.body:SetJustifyV("TOP")
 	b.body:SetWordWrap(true)
 	b.body:SetNonSpaceWrap(true)
+	b.reply = b:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+	b.reply:SetPoint("TOPLEFT", b.who, "BOTTOMLEFT", 0, -4)
+	b.reply:SetJustifyH("LEFT")
+	b.reply:SetTextColor(0.65, 0.8, 0.72)
+	b.when = b:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+	b.when:SetPoint("TOPRIGHT", b, "TOPRIGHT", -8, -6)
 	b.allow = CreateFrame("Button", nil, b, "UIPanelButtonTemplate")
 	b.allow:SetHeight(22)
 	b.allow:SetPoint("TOPLEFT", b.body, "BOTTOMLEFT", 0, -6)
 	b.allow:SetScript("OnClick", function(self)
-		WoWClaude.Allow(self.chatId, self.rules)
+		WoWWhatsApp.Allow(self.chatId, self.rules)
 	end)
 	b.allow:Hide()
 	-- FontStrings can't be selected, so a click opens the message in the copy box.
 	b:EnableMouse(true)
 	b:SetScript("OnMouseUp", function(self, button)
-		if button == "LeftButton" and self.text and self.text ~= "" then WoWClaude.ShowCopy(self.text) end
+		if button == "LeftButton" and self.text and self.text ~= "" then WoWWhatsApp.ShowCopy(self.text) end
 	end)
 	ui.bubbles[i] = b
 	return b
 end
 
-function WoWClaude.Render()
+function WoWWhatsApp.Render()
 	local c = ActiveChat()
 	if ui.content and c then
 		local width = ui.scroll:GetWidth()
 		if not width or width < 80 then width = 400 end
 		ui.content:SetWidth(width)
 		local y, n = 0, 0
-		local function Place(role, text, when, dim, denied)
+		local function Place(role, text, when, dim, denied, sender, replyTo)
 			n = n + 1
 			local b = GetBubble(n)
 			local st = ROLE_STYLE[role] or ROLE_STYLE.system
 			b:SetWidth(width)
 			b.bg:SetColorTexture(st.bg[1], st.bg[2], st.bg[3], st.bg[4])
 			b.accent:SetColorTexture(st.color[1], st.color[2], st.color[3], 0.9)
-			b.who:SetText(st.label)
+			b.who:SetText(sender and sender ~= "" and sender or st.label)
 			b.who:SetTextColor(st.color[1], st.color[2], st.color[3])
 			b.when:SetText(when or "")
 			b.body:SetWidth(width - 18)
+			if replyTo and replyTo ~= "" then
+				b.reply:SetText("Reply to " .. Display(replyTo))
+				b.reply:Show()
+				b.body:ClearAllPoints()
+				b.body:SetPoint("TOPLEFT", b.reply, "BOTTOMLEFT", 0, 2)
+			else
+				b.reply:Hide()
+				b.body:ClearAllPoints()
+				b.body:SetPoint("TOPLEFT", b.who, "BOTTOMLEFT", 0, -4)
+			end
 			b.body:SetText(Display(text))
 			if dim then
 				b.body:SetTextColor(0.72, 0.72, 0.72)
@@ -1569,6 +1664,7 @@ function WoWClaude.Render()
 			end
 			local h = b.body:GetStringHeight()
 			if not h or h < 1 then h = 14 end
+			local replyHeight = replyTo and replyTo ~= "" and 14 or 0
 			local extra = 0
 			if denied then
 				local label = "Allow " .. table.concat(denied, ", ") .. " & retry"
@@ -1581,7 +1677,7 @@ function WoWClaude.Render()
 			else
 				b.allow:Hide()
 			end
-			b:SetHeight(6 + 12 + 4 + h + 8 + extra)
+			b:SetHeight(6 + 12 + 4 + replyHeight + h + 8 + extra)
 			b:ClearAllPoints()
 			b:SetPoint("TOPLEFT", ui.content, "TOPLEFT", 0, -y)
 			b.text = text
@@ -1592,20 +1688,20 @@ function WoWClaude.Render()
 		for i, m in ipairs(c.history) do
 			-- The Allow button only makes sense on the newest reply, and only while idle.
 			local denied = (i == last and not c.pendingId and type(m.denied) == "table" and #m.denied > 0) and m.denied or nil
-			Place(m.role, m.text, m.t and date("%H:%M", m.t) or "", false, denied)
+			Place(m.role, m.text, m.t and date("%H:%M", m.t) or "", false, denied, m.sender, m.replyTo)
 		end
 		if c.pendingId then
 			local p = c.progress
 			local head = "working... " .. ActivityLine(c)
 			if run.statusText and run.statusText ~= "" then head = head .. "\n" .. run.statusText end
-			Place("claude", (p and p ~= "") and (head .. "\n\n" .. p) or head, "", true)
+			Place("whatsapp", (p and p ~= "") and (head .. "\n\n" .. p) or head, "", true)
 		elseif #c.history == 0 then
 			if run.restoring then
 				Place("system", "Connecting to the bridge and restoring your chats...", "", true)
-			elseif not WoWClaude.IsConnected() then
-				Place("system", "Not connected to the bridge. Start it (npm start in the wow-claude folder, or wow-claude in your project), then click Connect below.", "", true)
+			elseif not WoWWhatsApp.IsConnected() then
+				Place("system", "Not connected to the bridge. Start it (npm start in the wow-whatsapp folder, or wow-whatsapp in your project), then click Connect below.", "", true)
 			else
-				Place("system", "Click the box below and type to start. Shift-click an item, spell or quest to link it into your message. /wow-claude help lists the commands; /ai <text> and /r work from the game chat too.", "", true)
+				Place("system", "Click the box below and type to start. Shift-click an item, spell or quest to link it into your message. /wow-whatsapp help lists the commands; /ai <text> and /r work from the game chat too.", "", true)
 			end
 		end
 		for i = n + 1, #ui.bubbles do
@@ -1618,14 +1714,14 @@ function WoWClaude.Render()
 			end
 		end)
 	end
-	WoWClaude.UpdateStatus()
-	WoWClaude.RenderChatList()
+	WoWWhatsApp.UpdateStatus()
+	WoWWhatsApp.RenderChatList()
 end
 
--- Copy box (/wow-claude copy): a selectable EditBox with the last reply pre-highlighted for Ctrl+C.
-function WoWClaude.ShowCopy(text)
+-- Copy box (/wow-whatsapp copy): a selectable EditBox with the last reply pre-highlighted for Ctrl+C.
+function WoWWhatsApp.ShowCopy(text)
 	if not ui.copy then
-		local cf = CreateFrame("Frame", "WoWClaudeCopy", UIParent, "BackdropTemplate")
+		local cf = CreateFrame("Frame", "WoWWhatsAppCopy", UIParent, "BackdropTemplate")
 		cf:SetSize(560, 320)
 		cf:SetPoint("CENTER")
 		cf:SetFrameStrata("FULLSCREEN_DIALOG")
@@ -1638,7 +1734,7 @@ function WoWClaude.ShowCopy(text)
 		cf:SetBackdrop(BACKDROP)
 		cf:SetBackdropColor(0.05, 0.05, 0.07, 0.97)
 		cf:SetBackdropBorderColor(0.6, 0.6, 0.6, 1)
-		tinsert(UISpecialFrames, "WoWClaudeCopy")
+		tinsert(UISpecialFrames, "WoWWhatsAppCopy")
 
 		local t = cf:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 		t:SetPoint("TOPLEFT", cf, "TOPLEFT", 14, -12)
@@ -1647,10 +1743,10 @@ function WoWClaude.ShowCopy(text)
 		local x = CreateFrame("Button", nil, cf, "UIPanelCloseButton")
 		x:SetPoint("TOPRIGHT", cf, "TOPRIGHT", -4, -4)
 
-		local sc = CreateFrame("ScrollFrame", "WoWClaudeCopyScroll", cf, "UIPanelScrollFrameTemplate")
+		local sc = CreateFrame("ScrollFrame", "WoWWhatsAppCopyScroll", cf, "UIPanelScrollFrameTemplate")
 		sc:SetPoint("TOPLEFT", cf, "TOPLEFT", 14, -36)
 		sc:SetPoint("BOTTOMRIGHT", cf, "BOTTOMRIGHT", -32, 14)
-		local eb = CreateFrame("EditBox", "WoWClaudeCopyBox", sc)
+		local eb = CreateFrame("EditBox", "WoWWhatsAppCopyBox", sc)
 		eb:SetMultiLine(true)
 		eb:SetAutoFocus(false)
 		eb:SetFontObject(ChatFontNormal)
@@ -1667,7 +1763,7 @@ function WoWClaude.ShowCopy(text)
 	ui.copyBox:HighlightText()
 end
 
-function WoWClaude.RenderChatList()
+function WoWWhatsApp.RenderChatList()
 	if not ui.chatButtons then return end
 	for i, btn in ipairs(ui.chatButtons) do
 		local c = db.chats[i]
@@ -1692,7 +1788,7 @@ function WoWClaude.RenderChatList()
 	end
 end
 
-function WoWClaude.UpdateMini()
+function WoWWhatsApp.UpdateMini()
 	if not ui.miniBadge then return end
 	local unread, working = 0, 0
 	for _, c in ipairs(db.chats) do
@@ -1720,18 +1816,21 @@ function WoWClaude.UpdateMini()
 	end
 end
 
-local ECHO_DEFAULT = 4000 -- characters of a reply to print into the game chat ("/wow-claude echo <n>")
+local ECHO_DEFAULT = 4000 -- characters of a reply to print into the game chat ("/wow-whatsapp echo <n>")
 
 local function ChatLinks(chat)
-	return "  |Hclaude:reply:" .. chat.id .. "|h|cff55ff55[reply]|r|h |Hclaude:open:" .. chat.id .. "|h|cff7ec8ff[open]|r|h"
+	return "  |Hwhatsapp:open:" .. chat.id .. "|h|cff7ec8ff[open]|r|h"
 end
 
 -- Print a reply into the game chat: prefix on the first line, then the text line
 -- by line up to the limit, then clickable links. `short` prints one preview line.
-local function EchoToChat(chat, text)
+local function EchoToChat(chat, text, label, color, sender)
 	local mode = db.settings.echo
 	if mode == "off" then return end
-	local prefix = "|cff7ec8ff[Claude · " .. Display(chat.name) .. "]|r "
+	local action = label == "WhatsApp" and "whatsapp" or "open"
+	local prefix = "|Hwhatsapp:" .. action .. ":" .. chat.id .. "|h|cff" .. (color or "7ec8ff")
+		.. "[" .. (label or "WhatsApp") .. " · " .. Display(chat.name)
+		.. (sender and sender ~= "" and " · " .. Display(sender) or "") .. "]|r|h "
 	local body = Display(text)
 	if mode == "short" then
 		local flat = (body:gsub("%s+", " "))
@@ -1755,55 +1854,71 @@ local function EchoToChat(chat, text)
 	print("    " .. ChatLinks(chat):sub(3))
 end
 
+NotifyWhatsApp = function(chat, text, sender)
+	pcall(PlaySound, 3081)
+	WoWWhatsApp.UpdateMini()
+	run.lastMessenger = "whatsapp"
+	run.lastReplyChat = chat.id
+	EchoToChat(chat, text, "WhatsApp", "66ffcc", sender)
+	if ui.frame and ui.frame:IsShown() and db.activeChat == chat.id then return end
+	if UIErrorsFrame then
+		UIErrorsFrame:AddMessage("WhatsApp: " .. Display(chat.name), 0.4, 1, 0.8, 1)
+	end
+end
+
 -- A reply landed. Always play the sound and echo it to the game chat; if that
 -- chat isn't on screen, also flash the screen text and light up the mini bar.
-function WoWClaude.Notify(chat, text)
+function WoWWhatsApp.Notify(chat, text)
 	pcall(PlaySound, 3081)
-	WoWClaude.UpdateMini()
+	WoWWhatsApp.UpdateMini()
 	-- Until a real whisper arrives, /r replies to this chat.
-	run.lastMessenger = "claude"
+	run.lastMessenger = "whatsapp"
 	run.lastReplyChat = chat.id
 	EchoToChat(chat, text)
 	if ui.frame and ui.frame:IsShown() and db.activeChat == chat.id then return end
 	if UIErrorsFrame then
-		UIErrorsFrame:AddMessage("Claude replied in " .. Display(chat.name), 0.5, 0.8, 1, 1)
+		UIErrorsFrame:AddMessage("WhatsApp replied in " .. Display(chat.name), 0.5, 0.8, 1, 1)
 	end
 end
 
--- /r goes to Claude when Claude was the last one to message you, exactly like
--- whisper reply, and the box shows a "To Claude [chat]:" header while you type.
+-- /r goes to WhatsApp when WhatsApp was the last one to message you, exactly like
+-- whisper reply, and the box shows a "To WhatsApp [chat]:" header while you type.
 --
 -- The chat type underneath is left alone (a custom type would leak into chat
--- settings); instead the box remembers a Claude target, the header is repainted
+-- settings); instead the box remembers a WhatsApp target, the header is repainted
 -- over the game's own, and the send entry points are intercepted. Any other chat
 -- type, Tab, Esc or a cleared box drops the target again.
-local CLAUDE_R, CLAUDE_G, CLAUDE_B = 0.49, 0.78, 1.0
+local WHATSAPP_R, WHATSAPP_G, WHATSAPP_B = 0.49, 0.78, 1.0
 
-local function PaintClaudeHeader(eb, chat)
+local function PaintTargetHeader(eb, chat, messenger)
 	local header = _G[eb:GetName() .. "Header"]
 	local suffix = _G[eb:GetName() .. "HeaderSuffix"]
 	if not header then return end
-	eb.claudePainting = true
+	local label = messenger == "whatsapp" and "WhatsApp" or "WhatsApp"
+	local r, g, b = messenger == "whatsapp" and 0.4 or WHATSAPP_R, messenger == "whatsapp" and 1 or WHATSAPP_G, messenger == "whatsapp" and 0.8 or WHATSAPP_B
+	eb.whatsappPainting = true
 	eb:UpdateHeader() -- lay out normally first, then repaint
-	eb.claudePainting = nil
+	eb.whatsappPainting = nil
 	header:SetWidth(0)
-	header:SetText("To Claude [" .. Display(chat.name) .. "]: ")
-	header:SetTextColor(CLAUDE_R, CLAUDE_G, CLAUDE_B)
+	header:SetText("To " .. label .. " [" .. Display(chat.name) .. "]: ")
+	header:SetTextColor(r, g, b)
 	if suffix then suffix:Hide() end
 	eb:SetTextInsets(15 + header:GetWidth(), 13, 0, 0)
-	eb:SetTextColor(CLAUDE_R, CLAUDE_G, CLAUDE_B)
+	eb:SetTextColor(r, g, b)
 end
 
-local function SendBoxToClaude(eb)
-	local chat = FindChat(eb.claudeTarget)
+local function SendBoxToTarget(eb)
+	local chat = FindChat(eb.whatsappTarget)
 	local text = Trim(eb:GetText() or "")
-	eb.claudeTarget = nil
+	local messenger = eb.whatsappMessenger
+	eb.whatsappTarget = nil
+	eb.whatsappMessenger = nil
 	eb:ClearChat()
-	if chat and db.activeChat ~= chat.id then WoWClaude.SwitchChat(chat.id) end
+	if chat and db.activeChat ~= chat.id then WoWWhatsApp.SwitchChat(chat.id) end
 	if text ~= "" then
-		WoWClaude.Send(text)
+		WoWWhatsApp.Send(text)
 	else
-		WoWClaude.Toggle(true)
+		WoWWhatsApp.Toggle(true)
 		if ui.input then ui.input:SetFocus() end
 	end
 end
@@ -1811,38 +1926,40 @@ end
 local function HookReplyCommand()
 	for i = 1, (NUM_CHAT_WINDOWS or 10) do
 		local eb = _G["ChatFrame" .. i .. "EditBox"]
-		if eb and eb.ProcessChatType and not eb.claudeReplyHooked then
-			eb.claudeReplyHooked = true
+		if eb and eb.ProcessChatType and not eb.whatsappReplyHooked then
+			eb.whatsappReplyHooked = true
 
 			local origProcess = eb.ProcessChatType
 			eb.ProcessChatType = function(self, msg, index, send, ...)
 				if index ~= "REPLY" then
-					self.claudeTarget = nil
+					self.whatsappTarget = nil
 					return origProcess(self, msg, index, send, ...)
 				end
-				if not (db and run.lastMessenger == "claude") then
+				if not (db and (run.lastMessenger == "whatsapp" or run.lastMessenger == "whatsapp")) then
 					return origProcess(self, msg, index, send, ...)
 				end
 				local chat = FindChat(run.lastReplyChat) or ActiveChat()
 				if send == 1 then
 					self:SetText(msg or "")
-					self.claudeTarget = chat and chat.id
-					SendBoxToClaude(self)
+					self.whatsappTarget = chat and chat.id
+					self.whatsappMessenger = run.lastMessenger
+					SendBoxToTarget(self)
 					return true
 				end
-				self.claudeTarget = chat and chat.id
+				self.whatsappTarget = chat and chat.id
+				self.whatsappMessenger = run.lastMessenger
 				self:SetText(msg or "")
-				if chat then PaintClaudeHeader(self, chat) end
+				if chat then PaintTargetHeader(self, chat, run.lastMessenger) end
 				return true
 			end
 
-			-- Enter arrives here; nothing below us ever sees a Claude-targeted box.
+			-- Enter arrives here; nothing below us ever sees a WhatsApp-targeted box.
 			for _, name in ipairs({ "SendMessage", "SendText" }) do
 				local orig = eb[name]
 				if orig then
 					eb[name] = function(self, ...)
-						if self.claudeTarget then
-							SendBoxToClaude(self)
+						if self.whatsappTarget then
+							SendBoxToTarget(self)
 							return
 						end
 						return orig(self, ...)
@@ -1850,12 +1967,12 @@ local function HookReplyCommand()
 				end
 			end
 
-			-- Anything that repaints the header normally (Tab, /s, sticky reset) ends Claude mode.
+			-- Anything that repaints the header normally (Tab, /s, sticky reset) ends WhatsApp mode.
 			hooksecurefunc(eb, "UpdateHeader", function(self)
-				if not self.claudePainting then self.claudeTarget = nil end
+				if not self.whatsappPainting then self.whatsappTarget = nil end
 			end)
 			hooksecurefunc(eb, "ClearChat", function(self)
-				self.claudeTarget = nil
+				self.whatsappTarget = nil
 			end)
 		end
 	end
@@ -1863,10 +1980,25 @@ end
 
 -- Clicks on our [reply] / [open] links in the chat frame.
 hooksecurefunc("SetItemRef", function(link)
-	local action, chatId = tostring(link):match("^claude:(%a+):(%w+)")
+	local action, chatId = tostring(link):match("^whatsapp:(%a+):(.+)$")
 	if not action or not db then return end
-	if FindChat(chatId) then WoWClaude.SwitchChat(chatId) end
-	WoWClaude.Toggle(true)
+	local chat = FindChat(chatId)
+	if chat then WoWWhatsApp.SwitchChat(chatId) end
+	if action == "whatsapp" and chat then
+		run.lastMessenger = "whatsapp"
+		run.lastReplyChat = chat.id
+		local eb = _G["ChatFrame1EditBox"]
+		if eb then
+			ChatEdit_ActivateChat(eb)
+			eb:SetChatType("REPLY")
+			eb.whatsappTarget = chat.id
+			eb.whatsappMessenger = "whatsapp"
+			eb:SetText("")
+			PaintTargetHeader(eb, chat, "whatsapp")
+		end
+		return
+	end
+	WoWWhatsApp.Toggle(true)
 	if action == "reply" and ui.input then ui.input:SetFocus() end
 end)
 
@@ -1907,7 +2039,7 @@ local function BuildUI()
 	if ui.frame then return end
 	local s = db.settings
 
-	local f = CreateFrame("Frame", "WoWClaudeFrame", UIParent, "BackdropTemplate")
+	local f = CreateFrame("Frame", "WoWWhatsAppFrame", UIParent, "BackdropTemplate")
 	ui.frame = f
 	f:SetSize(s.width, s.height)
 	if s.point then
@@ -1932,7 +2064,7 @@ local function BuildUI()
 	f:SetBackdropColor(0.05, 0.05, 0.07, 0.95)
 	f:SetBackdropBorderColor(0.6, 0.6, 0.6, 1)
 	f:Hide()
-	tinsert(UISpecialFrames, "WoWClaudeFrame")
+	tinsert(UISpecialFrames, "WoWWhatsAppFrame")
 
 	-- Status light: green = bridge seen recently, yellow = stale, red = gone.
 	local function MakeDot(parent)
@@ -1957,7 +2089,7 @@ local function BuildUI()
 
 	local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
 	title:SetPoint("LEFT", dotHolder, "RIGHT", 6, 0)
-	title:SetText("WoW Claude")
+	title:SetText("WoW WhatsApp")
 	ui.title = title
 
 	local status = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
@@ -1988,11 +2120,11 @@ local function BuildUI()
 		hl:SetColorTexture(1, 1, 1, 0.15)
 	end
 	mini:SetPoint("TOPRIGHT", f, "TOPRIGHT", -4, -4)
-	mini:SetScript("OnClick", function() WoWClaude.Minimize(true) end)
+	mini:SetScript("OnClick", function() WoWWhatsApp.Minimize(true) end)
 	mini:SetScript("OnEnter", function(self)
 		GameTooltip:SetOwner(self, "ANCHOR_LEFT")
 		GameTooltip:SetText("Minimize to the small bar  (Esc)")
-		GameTooltip:AddLine("Claude keeps working; the bar shows when a reply lands.", 0.8, 0.8, 0.8, true)
+		GameTooltip:AddLine("WhatsApp keeps working; the bar shows when a reply lands.", 0.8, 0.8, 0.8, true)
 		GameTooltip:Show()
 	end)
 	mini:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -2007,7 +2139,7 @@ local function BuildUI()
 		if not db or not db.settings.shown or not UIParent:IsShown() then return end
 		db.settings.minimized = true
 		if ui.mini then ui.mini:Show() end
-		WoWClaude.UpdateMini()
+		WoWWhatsApp.UpdateMini()
 	end)
 
 	-- Left panel: chat list
@@ -2024,13 +2156,13 @@ local function BuildUI()
 	panel:SetBackdropColor(0, 0, 0, 0.4)
 	panel:SetBackdropBorderColor(0.4, 0.4, 0.4, 1)
 
-	local newBtn = MakeButton(panel, "+ New chat", PANEL_W - 16, function() WoWClaude.NewChat() end)
+	local newBtn = MakeButton(panel, "+ New chat", PANEL_W - 16, function() WoWWhatsApp.NewChat() end)
 	newBtn:SetPoint("TOP", panel, "TOP", 0, -8)
 
 	-- Per-chat menu: Rename and Folder, opened by right-clicking a chat row. A
 	-- plain frame of our own rather than a Blizzard dropdown, so it looks the
 	-- same on every client.
-	local menu = CreateFrame("Frame", "WoWClaudeChatMenu", f, "BackdropTemplate")
+	local menu = CreateFrame("Frame", "WoWWhatsAppChatMenu", f, "BackdropTemplate")
 	menu:SetSize(110, 3 * 20 + 12)
 	menu:SetFrameStrata("TOOLTIP")
 	menu:SetBackdrop({
@@ -2063,8 +2195,8 @@ local function BuildUI()
 		end)
 		return it
 	end
-	MenuItem("Rename...", 1, WoWClaude.RenamePrompt)
-	MenuItem("Folder...", 2, WoWClaude.FolderPrompt)
+	MenuItem("Rename...", 1, WoWWhatsApp.RenamePrompt)
+	MenuItem("Folder...", 2, WoWWhatsApp.FolderPrompt)
 	-- Close once the mouse has wandered away from the menu and the row it came from.
 	menu:SetScript("OnUpdate", function(self, dt)
 		if not MouseIsOver then return end
@@ -2078,7 +2210,7 @@ local function BuildUI()
 	menu:Hide()
 	ui.chatMenu = menu
 
-	function WoWClaude.ShowChatMenu(chatId, anchor)
+	function WoWWhatsApp.ShowChatMenu(chatId, anchor)
 		local c = FindChat(chatId)
 		if not c then return end
 		if menu:IsShown() and menu.chatId == chatId then
@@ -2121,7 +2253,7 @@ local function BuildUI()
 			b.del:SetHighlightTexture("Interface\\Buttons\\UI-GroupLoot-Pass-Highlight")
 		end
 		b.del:SetAlpha(0.6)
-		b.del:SetScript("OnClick", function() WoWClaude.ConfirmDelete(b.chatId) end)
+		b.del:SetScript("OnClick", function() WoWWhatsApp.ConfirmDelete(b.chatId) end)
 		b.del:SetScript("OnEnter", function(self)
 			self:SetAlpha(1)
 			GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
@@ -2143,32 +2275,32 @@ local function BuildUI()
 		b:RegisterForClicks("LeftButtonUp", "RightButtonUp")
 		b:SetScript("OnClick", function(self, button)
 			if button == "RightButton" then
-				WoWClaude.ShowChatMenu(self.chatId, self)
+				WoWWhatsApp.ShowChatMenu(self.chatId, self)
 			else
-				WoWClaude.SwitchChat(self.chatId)
+				WoWWhatsApp.SwitchChat(self.chatId)
 			end
 		end)
 		b:SetScript("OnDoubleClick", function(self)
-			WoWClaude.SwitchChat(self.chatId)
-			WoWClaude.RenamePrompt(self.chatId)
+			WoWWhatsApp.SwitchChat(self.chatId)
+			WoWWhatsApp.RenamePrompt(self.chatId)
 		end)
 		b:Hide()
 		ui.chatButtons[i] = b
 	end
 
 	-- Transcript: a scrolling stack of message bubbles
-	local scroll = CreateFrame("ScrollFrame", "WoWClaudeScroll", f, "UIPanelScrollFrameTemplate")
+	local scroll = CreateFrame("ScrollFrame", "WoWWhatsAppScroll", f, "UIPanelScrollFrameTemplate")
 	scroll:SetPoint("TOPLEFT", panel, "TOPRIGHT", 8, 0)
 	scroll:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -32, 110)
 	ui.scroll = scroll
 
-	local content = CreateFrame("Frame", "WoWClaudeContent", scroll)
+	local content = CreateFrame("Frame", "WoWWhatsAppContent", scroll)
 	content:SetSize(500, 1)
 	scroll:SetScrollChild(content)
 	ui.content = content
 	ui.bubbles = {}
 	scroll:HookScript("OnSizeChanged", function(self, w, h)
-		if ui.frame:IsShown() then WoWClaude.Render() end
+		if ui.frame:IsShown() then WoWWhatsApp.Render() end
 	end)
 
 	-- Input box, with Send docked at its right end like a messaging app.
@@ -2186,17 +2318,17 @@ local function BuildUI()
 	inputBg:SetBackdropColor(0, 0, 0, 0.6)
 	inputBg:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
 
-	local inScroll = CreateFrame("ScrollFrame", "WoWClaudeInputScroll", inputBg, "UIPanelScrollFrameTemplate")
+	local inScroll = CreateFrame("ScrollFrame", "WoWWhatsAppInputScroll", inputBg, "UIPanelScrollFrameTemplate")
 	inScroll:SetPoint("TOPLEFT", inputBg, "TOPLEFT", 8, -6)
 	inScroll:SetPoint("BOTTOMRIGHT", inputBg, "BOTTOMRIGHT", -24, 6)
 
-	local input = CreateFrame("EditBox", "WoWClaudeInput", inScroll)
+	local input = CreateFrame("EditBox", "WoWWhatsAppInput", inScroll)
 	input:SetMultiLine(true)
 	input:SetAutoFocus(false)
 	input:SetFontObject(ChatFontNormal)
 	input:SetMaxLetters(0)
 	input:SetSize(500, 40)
-	input:SetScript("OnEnterPressed", function() WoWClaude.SendFromInput() end)
+	input:SetScript("OnEnterPressed", function() WoWWhatsApp.SendFromInput() end)
 	input:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
 	inScroll:SetScrollChild(input)
 	inScroll:HookScript("OnSizeChanged", function(self, w, h)
@@ -2206,19 +2338,19 @@ local function BuildUI()
 	ui.input = input
 
 	-- Send sits to the right of the input box, vertically centred on it.
-	local send = MakeButton(f, "Send", SEND_W, WoWClaude.SendFromInput)
+	local send = MakeButton(f, "Send", SEND_W, WoWWhatsApp.SendFromInput)
 	send:SetHeight(30)
 	send:SetPoint("LEFT", inputBg, "RIGHT", 6, 0)
 	ui.send = send
 
 	-- Connect stands in for Send until the bridge has been seen (see UpdateConnect).
-	local connect = MakeButton(f, "Connect", SEND_W, WoWClaude.Connect)
+	local connect = MakeButton(f, "Connect", SEND_W, WoWWhatsApp.Connect)
 	connect:SetHeight(30)
 	connect:SetPoint("LEFT", inputBg, "RIGHT", 6, 0)
 	connect:SetScript("OnEnter", function(self)
 		GameTooltip:SetOwner(self, "ANCHOR_TOP")
 		GameTooltip:SetText("Connect to the bridge")
-		GameTooltip:AddLine("The bridge must be running on this PC (npm start in wow-claude, or wow-claude in your project). The light turns green once it answers.", 0.8, 0.8, 0.8, true)
+		GameTooltip:AddLine("The bridge must be running on this PC (npm start in wow-whatsapp, or wow-whatsapp in your project). The light turns green once it answers.", 0.8, 0.8, 0.8, true)
 		GameTooltip:Show()
 	end)
 	connect:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -2237,25 +2369,25 @@ local function BuildUI()
 	local clear = MakeButton(f, "Clear", 60, function()
 		local c = ActiveChat()
 		if c then wipe(c.history) end
-		WoWClaude.Render()
+		WoWWhatsApp.Render()
 	end)
 	clear:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 14, 16)
 
-	local resend = MakeButton(f, "Resend", 70, WoWClaude.Resend)
+	local resend = MakeButton(f, "Resend", 70, WoWWhatsApp.Resend)
 	resend:SetPoint("LEFT", clear, "RIGHT", 6, 0)
 	resend:Hide()
 	ui.resend = resend
 
-	-- A named, always-present button so a keybinding can click it (see /wow-claude bind).
-	local hotkey = CreateFrame("Button", "WoWClaudeRefreshButton", UIParent)
+	-- A named, always-present button so a keybinding can click it (see /wow-whatsapp bind).
+	local hotkey = CreateFrame("Button", "WoWWhatsAppRefreshButton", UIParent)
 	hotkey:SetSize(1, 1)
 	hotkey:SetPoint("TOPLEFT", UIParent, "TOPLEFT", -10, 10)
 	hotkey:SetScript("OnClick", function()
 		local c = ActiveChat()
 		if c and c.pendingId then
-			WoWClaude.Send("")
+			WoWWhatsApp.Send("")
 		else
-			WoWClaude.Toggle()
+			WoWWhatsApp.Toggle()
 		end
 	end)
 
@@ -2280,7 +2412,7 @@ local function BuildUI()
 	end)
 
 	-- Mini bar: what the window collapses into. Click it to expand, drag to move.
-	local m = CreateFrame("Frame", "WoWClaudeMini", UIParent, "BackdropTemplate")
+	local m = CreateFrame("Frame", "WoWWhatsAppMini", UIParent, "BackdropTemplate")
 	ui.mini = m
 	m:SetSize(250, 30)
 	if s.miniPoint then
@@ -2305,7 +2437,7 @@ local function BuildUI()
 	end)
 	m:SetScript("OnMouseUp", function(self, button)
 		if button == "LeftButton" and not self.dragging then
-			WoWClaude.Minimize(false)
+			WoWWhatsApp.Minimize(false)
 		end
 	end)
 	m:SetBackdrop(BACKDROP)
@@ -2319,7 +2451,7 @@ local function BuildUI()
 
 	local mlabel = m:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 	mlabel:SetPoint("LEFT", miniDotHolder, "RIGHT", 6, 0)
-	mlabel:SetText("WoW Claude")
+	mlabel:SetText("WoW WhatsApp")
 
 	local badge = m:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 	badge:SetPoint("LEFT", mlabel, "RIGHT", 8, 0)
@@ -2348,16 +2480,16 @@ local function BuildUI()
 	local mclose = CreateFrame("Button", nil, m, "UIPanelCloseButton")
 	mclose:SetSize(24, 24)
 	mclose:SetPoint("RIGHT", m, "RIGHT", -2, 0)
-	mclose:SetScript("OnClick", function() WoWClaude.Toggle(false) end)
+	mclose:SetScript("OnClick", function() WoWWhatsApp.Toggle(false) end)
 	mclose:SetScript("OnEnter", function(self)
 		GameTooltip:SetOwner(self, "ANCHOR_LEFT")
-		GameTooltip:SetText("Quit: hide completely (/wow-claude brings it back)")
+		GameTooltip:SetText("Quit: hide completely (/wow-whatsapp brings it back)")
 		GameTooltip:Show()
 	end)
 	mclose:SetScript("OnLeave", function() GameTooltip:Hide() end)
 end
 
-function WoWClaude.Toggle(show)
+function WoWWhatsApp.Toggle(show)
 	if not ui.frame then return end
 	if show == nil then show = not ui.frame:IsShown() end
 	if show then
@@ -2371,15 +2503,15 @@ function WoWClaude.Toggle(show)
 	ui.quitting = nil
 	db.settings.shown = show
 	if show then
-		WoWClaude.Render()
+		WoWWhatsApp.Render()
 		-- No auto-focus: the game keeps the keyboard until you click the box.
 		-- No automatic hello either: if the bridge hasn't been seen, the panel
 		-- shows Connect in place of Send and waits for a click.
 	end
-	WoWClaude.UpdateMini()
+	WoWWhatsApp.UpdateMini()
 end
 
-function WoWClaude.Minimize(mini)
+function WoWWhatsApp.Minimize(mini)
 	if not ui.frame then return end
 	if mini == nil then mini = not db.settings.minimized end
 	if mini then
@@ -2387,9 +2519,9 @@ function WoWClaude.Minimize(mini)
 		db.settings.shown = true
 		ui.frame:Hide() -- OnHide shows the mini bar
 		if ui.mini and not ui.mini:IsShown() then ui.mini:Show() end
-		WoWClaude.UpdateMini()
+		WoWWhatsApp.UpdateMini()
 	else
-		WoWClaude.Toggle(true)
+		WoWWhatsApp.Toggle(true)
 	end
 end
 
@@ -2398,44 +2530,35 @@ end
 ---------------------------------------------------------------------------
 
 local HELP = table.concat({
-	"/wow-claude                        toggle the window (/claude works too)",
-	"/wow-claude mini                   collapse to the small bar (click the bar to expand)",
-	"/wow-claude hide                   hide the window completely",
-	"/ai <text>                         send <text> to the current chat straight from the game chat box",
-	"/r <text>                          replies to Claude when Claude was the last to message you (else normal whisper reply)",
-	"/wow-claude <text>                 same as /ai",
-	"/wow-claude echo full|short|off|<chars>   how much of each reply to print in the game chat",
-	"/wow-claude longchat on|off        let the game chat box take 4000 characters (for long /ai messages)",
-	"/wow-claude new [name]             start a new chat (its own Claude session, like a new terminal)",
-	"/wow-claude chat <n|name>          switch chats (or click one in the left panel)",
-	"/wow-claude rename [name]          rename the current chat (no name = dialog; right-clicking the chat in the left panel offers it too)",
-	"/wow-claude delete                 delete the current chat",
-	"/wow-claude cd <folder>            folder this chat's Claude works in (relative to the bridge's folder; no folder = back to default). Right-clicking the chat in the left panel and picking Folder does the same",
-	"/wow-claude reset                  next message in this chat starts a fresh Claude session",
-	"/wow-claude context [on|off]       what Claude is told about your character and where you are (no argument = show it)",
-	"/wow-claude mode pixel             no-reload transport (default)",
-	"/wow-claude mode reload            fallback transport: a /reload per step",
-	"/wow-claude resend                 show the strip again if the bridge missed it",
-	"/wow-claude reload                 reload now (also frees the slot pool)",
-	"/wow-claude cancel                 stop waiting on this chat's reply",
-	"/wow-claude copy                   open the last reply in a selectable box for Ctrl+C",
-	"/wow-claude bind <key>             hotkey: checks for a reply while waiting, else toggles the window",
-	"/wow-claude auto on|off            reload-mode only: auto-reload on your next keypress after the interval",
-	"/wow-claude signal on|off          the cheap sound-file readiness check (off if it spams errors)",
-	"/wow-claude slots                  how many reply slots are still free this session",
-	"/wow-claude diag                   transport diagnostics (is the cheap sound-file channel working?)",
-	"/wow-claude clear                  clear this chat's transcript",
+	"/wow-whatsapp                    toggle the WhatsApp window (/wa also works)",
+	"/wow-whatsapp mini               collapse to the small bar",
+	"/wow-whatsapp hide               hide the window completely",
+	"/ai <text>                       send text to the current WhatsApp chat",
+	"/r <text>                        reply to the last WhatsApp message",
+	"/wow-whatsapp <text>             same as /ai",
+	"/wow-whatsapp new [name]         create a new WhatsApp chat",
+	"/wow-whatsapp chat <n|name>      switch chats",
+	"/wow-whatsapp rename [name]      rename the current chat",
+	"/wow-whatsapp cd <folder>        keep a local folder label for this chat",
+	"/wow-whatsapp delete             delete the current chat",
+	"/wow-whatsapp clear              clear this chat's transcript",
+	"/wow-whatsapp echo full|short|off  control messages echoed to game chat",
+	"/wow-whatsapp mode pixel|reload  choose normal or reload fallback transport",
+	"/wow-whatsapp reload             reload now and free the slot pool",
+	"/wow-whatsapp copy               copy the last message",
+	"/wow-whatsapp slots              show remaining reply slots",
+	"/wow-whatsapp diag               show transport diagnostics",
 }, "\n")
 
--- /ai <text>: send straight from the game chat box (like /r, but for Claude).
-SLASH_CLAUDEASK1 = "/ai"
-SLASH_CLAUDEASK2 = "/ask"
-SlashCmdList["CLAUDEASK"] = function(msg)
+-- /ai <text>: send straight from the game chat box (like /r, but for WhatsApp).
+SLASH_WHATSAPPASK1 = "/ai"
+SLASH_WHATSAPPASK2 = "/ask"
+SlashCmdList["WHATSAPPASK"] = function(msg)
 	msg = Trim(msg or "")
 	if msg == "" then
-		WoWClaude.Toggle(true)
+		WoWWhatsApp.Toggle(true)
 	else
-		WoWClaude.Send(msg)
+		WoWWhatsApp.Send(msg)
 	end
 end
 
@@ -2445,9 +2568,11 @@ local function ApplyLongChat()
 	box:SetMaxLetters(db.settings.longchat and 4000 or 255)
 end
 
-SLASH_WOWCLAUDE1 = "/wow-claude"
-SLASH_WOWCLAUDE2 = "/claude"
-SlashCmdList["WOWCLAUDE"] = function(msg)
+SLASH_WOWWHATSAPP1 = "/wow-whatsapp"
+SLASH_WOWWHATSAPP2 = "/wa"
+SLASH_WOWWHATSAPP3 = "/wow-whatsapp" -- legacy alias
+SLASH_WOWWHATSAPP4 = "/whatsapp" -- legacy alias
+SlashCmdList["WOWWHATSAPP"] = function(msg)
 	msg = Trim(msg or "")
 	local cmd, rest = msg:match("^(%S+)%s*(.-)$")
 	cmd = cmd and cmd:lower() or ""
@@ -2455,11 +2580,11 @@ SlashCmdList["WOWCLAUDE"] = function(msg)
 	local c = ActiveChat()
 
 	if cmd == "" then
-		WoWClaude.Toggle()
+		WoWWhatsApp.Toggle()
 	elseif cmd == "mini" or cmd == "min" then
-		WoWClaude.Minimize(true)
+		WoWWhatsApp.Minimize(true)
 	elseif cmd == "new" then
-		WoWClaude.NewChat(rest)
+		WoWWhatsApp.NewChat(rest)
 	elseif cmd == "chat" or cmd == "chats" then
 		local n = tonumber(rest)
 		local target = n and db.chats[n]
@@ -2469,34 +2594,35 @@ SlashCmdList["WOWCLAUDE"] = function(msg)
 			end
 		end
 		if target then
-			WoWClaude.SwitchChat(target.id)
+			WoWWhatsApp.SwitchChat(target.id)
 		else
 			local lines = {}
 			for i, ch in ipairs(db.chats) do
 				table.insert(lines, i .. ". " .. ch.name .. (ch.id == db.activeChat and "  (current)" or "") .. (ch.pendingId and "  working" or "") .. ((ch.unread or 0) > 0 and ("  " .. ch.unread .. " new") or ""))
 			end
 			AddHistory(c, "system", "Chats:\n" .. table.concat(lines, "\n"))
-			WoWClaude.Render()
+			WoWWhatsApp.Render()
 		end
-		WoWClaude.Toggle(true)
+		WoWWhatsApp.Toggle(true)
 	elseif cmd == "rename" then
 		if rest ~= "" then
 			c.name = rest:sub(1, 24)
-			WoWClaude.Render()
+			c.customName = true
+			WoWWhatsApp.Render()
 		else
-			WoWClaude.RenameActive()
+			WoWWhatsApp.RenameActive()
 		end
-		WoWClaude.Toggle(true)
+		WoWWhatsApp.Toggle(true)
 	elseif cmd == "delete" then
-		WoWClaude.DeleteChat()
+		WoWWhatsApp.DeleteChat()
 	elseif cmd == "cd" then
-		WoWClaude.SetFolder(rest, c)
-		WoWClaude.Toggle(true)
+		WoWWhatsApp.SetFolder(rest, c)
+		WoWWhatsApp.Toggle(true)
 	elseif cmd == "reset" then
 		c.resetNext = true
-		AddHistory(c, "system", "Next message starts a fresh Claude session in " .. c.cwd)
-		WoWClaude.Render()
-		WoWClaude.Toggle(true)
+		AddHistory(c, "system", "Next message starts a fresh WhatsApp session in " .. c.cwd)
+		WoWWhatsApp.Render()
+		WoWWhatsApp.Toggle(true)
 	elseif cmd == "context" or cmd == "ctx" then
 		rest = rest:lower()
 		if rest == "on" or rest == "off" then
@@ -2504,15 +2630,15 @@ SlashCmdList["WOWCLAUDE"] = function(msg)
 			-- Make sure the next record carries the change, hello throttle or not.
 			run.contextSent = nil
 			run.lastHelloAt = nil
-			if WoWClaude.IsConnected() then WoWClaude.SayHello() end
+			if WoWWhatsApp.IsConnected() then WoWWhatsApp.SayHello() end
 		end
-		local ctx = WoWClaude.GameContext()
+		local ctx = WoWWhatsApp.GameContext()
 		AddHistory(c, "system", (s.context
-			and "Game context is ON: Claude is told this with each message (it goes into its system prompt, so unrelated projects are unaffected by anything but a few lines). /wow-claude context off to stop.\n\n"
-			or "Game context is OFF: Claude is told nothing about the game. /wow-claude context on to send this:\n\n") .. ctx
-			.. "\n\nTip: click the input box, then shift-click an item, spell or quest to link it into your message; Claude gets its tooltip.")
-		WoWClaude.Render()
-		WoWClaude.Toggle(true)
+			and "Game context is ON: WhatsApp is told this with each message (it goes into its system prompt, so unrelated projects are unaffected by anything but a few lines). /wow-whatsapp context off to stop.\n\n"
+			or "Game context is OFF: WhatsApp is told nothing about the game. /wow-whatsapp context on to send this:\n\n") .. ctx
+			.. "\n\nTip: click the input box, then shift-click an item, spell or quest to link it into your message; WhatsApp gets its tooltip.")
+		WoWWhatsApp.Render()
+		WoWWhatsApp.Toggle(true)
 	elseif cmd == "mode" then
 		if rest == "pixel" or rest == "reload" then
 			s.mode = rest
@@ -2520,10 +2646,10 @@ SlashCmdList["WOWCLAUDE"] = function(msg)
 		else
 			AddHistory(c, "system", "mode is " .. s.mode .. " (pixel or reload)")
 		end
-		WoWClaude.Render()
-		WoWClaude.Toggle(true)
+		WoWWhatsApp.Render()
+		WoWWhatsApp.Toggle(true)
 	elseif cmd == "resend" then
-		WoWClaude.Resend()
+		WoWWhatsApp.Resend()
 	elseif cmd == "auto" then
 		local n = tonumber(rest)
 		if n then
@@ -2534,14 +2660,14 @@ SlashCmdList["WOWCLAUDE"] = function(msg)
 		elseif rest == "off" then
 			s.autoRefresh = false
 		end
-		WoWClaude.UpdateStatus()
-		WoWClaude.ArmAutoRefresh()
+		WoWWhatsApp.UpdateStatus()
+		WoWWhatsApp.ArmAutoRefresh()
 	elseif cmd == "hide" or cmd == "quit" then
-		WoWClaude.Toggle(false)
+		WoWWhatsApp.Toggle(false)
 	elseif cmd == "copy" then
 		for i = #c.history, 1, -1 do
-			if c.history[i].role == "claude" then
-				WoWClaude.ShowCopy(c.history[i].text)
+			if c.history[i].role == "whatsapp" then
+				WoWWhatsApp.ShowCopy(c.history[i].text)
 				break
 			end
 		end
@@ -2552,35 +2678,35 @@ SlashCmdList["WOWCLAUDE"] = function(msg)
 			s.echo = tostring(math.max(200, math.floor(tonumber(rest))))
 		end
 		AddHistory(c, "system", "replies in game chat: " .. s.echo .. " (full = " .. ECHO_DEFAULT .. " chars, short, off, or a number of characters)")
-		WoWClaude.Render()
+		WoWWhatsApp.Render()
 	elseif cmd == "longchat" then
 		if rest == "on" then s.longchat = true elseif rest == "off" then s.longchat = false end
 		ApplyLongChat()
 		AddHistory(c, "system", "game chat box limit: " .. (s.longchat and "4000 characters (fine for /ai; real chat over 255 may be rejected by the server)" or "255 (default)"))
-		WoWClaude.Render()
+		WoWWhatsApp.Render()
 	elseif cmd == "signal" then
 		if rest == "on" then s.signal = true elseif rest == "off" then s.signal = false end
 		AddHistory(c, "system", "signal check is " .. (s.signal and "on" or "off"))
-		WoWClaude.Render()
+		WoWWhatsApp.Render()
 	elseif cmd == "slots" then
 		local free = 0
 		for i = 1, SLOT_COUNT do
 			if not C_AddOns.IsAddOnLoaded(SlotName(i)) then free = free + 1 end
 		end
 		AddHistory(c, "system", free .. " of " .. SLOT_COUNT .. " reply slots free this session (a reload frees all)")
-		WoWClaude.Render()
-		WoWClaude.Toggle(true)
+		WoWWhatsApp.Render()
+		WoWWhatsApp.Toggle(true)
 	elseif cmd == "refresh" or cmd == "reload" then
 		SafeReload()
 	elseif cmd == "bind" then
 		local key = rest:upper()
 		if key ~= "" and not InCombatLockdown() then
-			SetBinding(key, "CLICK WoWClaudeRefreshButton:LeftButton")
+			SetBinding(key, "CLICK WoWWhatsAppRefreshButton:LeftButton")
 			SaveBindings(GetCurrentBindingSet())
 			AddHistory(c, "system", key .. " is now bound: checks for a reply while waiting, otherwise toggles this window")
 		end
-		WoWClaude.Render()
-		WoWClaude.Toggle(true)
+		WoWWhatsApp.Render()
+		WoWWhatsApp.Toggle(true)
 	elseif cmd == "diag" then
 		local free = 0
 		for i = 1, SLOT_COUNT do
@@ -2592,7 +2718,7 @@ SlashCmdList["WOWCLAUDE"] = function(msg)
 			"sound checks: " .. signalStats.checks .. ", valid hits: " .. signalStats.hits .. (signalStats.lastHit and (", last hit " .. FmtDur(GetTime() - signalStats.lastHit) .. " ago") or ""),
 			"slot polls this session: " .. (run.polls or 0) .. ", free slots: " .. free .. "/" .. SLOT_COUNT,
 			"presence: head at " .. tostring(run.presence and run.presence.last or "?") .. ", beats seen: " .. tostring(run.presence and run.presence.beats or 0),
-			select(5, WoWClaude.BridgeState()),
+			select(5, WoWWhatsApp.BridgeState()),
 			"mode: " .. s.mode .. ", session token: " .. tostring(db.session),
 		}
 		for _, ch in ipairs(db.chats) do
@@ -2602,8 +2728,8 @@ SlashCmdList["WOWCLAUDE"] = function(msg)
 			end
 		end
 		AddHistory(c, "system", "Diagnostics:\n" .. table.concat(lines, "\n"))
-		WoWClaude.Render()
-		WoWClaude.Toggle(true)
+		WoWWhatsApp.Render()
+		WoWWhatsApp.Toggle(true)
 	elseif cmd == "cancel" then
 		if c.pendingId then
 			AddHistory(c, "system", "Gave up waiting on #" .. c.pendingId)
@@ -2614,18 +2740,22 @@ SlashCmdList["WOWCLAUDE"] = function(msg)
 			RefreshStrip()
 			if not AnyPending() then keyCatcher:Hide() end
 		end
-		WoWClaude.Render()
+		WoWWhatsApp.Render()
 	elseif cmd == "clear" then
 		wipe(c.history)
-		WoWClaude.Render()
+		WoWWhatsApp.Render()
 	elseif cmd == "help" then
 		AddHistory(c, "system", HELP)
-		WoWClaude.Render()
-		WoWClaude.Toggle(true)
+		WoWWhatsApp.Render()
+		WoWWhatsApp.Toggle(true)
 	else
-		WoWClaude.Send(msg)
+		WoWWhatsApp.Send(msg)
 	end
 end
+
+SLASH_WOWWHATSAPP1 = "/wow-whatsapp"
+SLASH_WOWWHATSAPP2 = "/wa"
+SlashCmdList["WOWWHATSAPP"] = SlashCmdList["WOWWHATSAPP"]
 
 ---------------------------------------------------------------------------
 -- Events
@@ -2669,26 +2799,26 @@ ev:SetScript("OnEvent", function(self, event, arg1)
 			ui.input:SetText(c.draft)
 			if not c.pendingId then c.draft = nil end
 		end
-		WoWClaude.Render()
+		WoWWhatsApp.Render()
 		if db.settings.shown then
 			if db.settings.minimized then
-				WoWClaude.Minimize(true)
+				WoWWhatsApp.Minimize(true)
 			else
-				WoWClaude.Toggle(true)
+				WoWWhatsApp.Toggle(true)
 			end
 		end
-		WoWClaude.ArmAutoRefresh()
-		WoWClaude.UpdateDot()
+		WoWWhatsApp.ArmAutoRefresh()
+		WoWWhatsApp.UpdateDot()
 		if db.settings.longchat then ApplyLongChat() end
 		HookReplyCommand()
 		C_Timer.NewTicker(TICK_SECONDS, Tick)
-		C_Timer.After(3, WoWClaude.SayHello)
+		C_Timer.After(3, WoWWhatsApp.SayHello)
 	elseif event == "PLAYER_REGEN_ENABLED" then
-		if WoWClaude.reloadAfterCombat then
-			WoWClaude.reloadAfterCombat = nil
+		if WoWWhatsApp.reloadAfterCombat then
+			WoWWhatsApp.reloadAfterCombat = nil
 			ReloadUI()
 		elseif db then
-			WoWClaude.ArmAutoRefresh()
+			WoWWhatsApp.ArmAutoRefresh()
 		end
 	end
 end)

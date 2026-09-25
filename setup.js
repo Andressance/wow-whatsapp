@@ -14,7 +14,7 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const ROOT = __dirname;
-const ADDON_SRC = path.join(ROOT, 'addon', 'WoWClaude');
+const ADDON_SRC = path.join(ROOT, 'addon', 'WoWWhatsApp');
 const BRIDGE = path.join(ROOT, 'bridge');
 const CONFIG = path.join(BRIDGE, 'config.json');
 const EXAMPLE = path.join(BRIDGE, 'config.example.json');
@@ -61,7 +61,7 @@ function findAccount(client) {
 }
 
 function copyAddon(client) {
-  const dest = path.join(client, 'Interface', 'AddOns', 'WoWClaude');
+  const dest = path.join(client, 'Interface', 'AddOns', 'WoWWhatsApp');
   fs.mkdirSync(dest, { recursive: true });
   let copied = 0;
   for (const f of fs.readdirSync(ADDON_SRC)) {
@@ -80,8 +80,8 @@ function writeConfig(client, account) {
   }
   const cfg = JSON.parse(fs.readFileSync(EXAMPLE, 'utf8'));
   cfg.addonDir = path.join(client, 'Interface', 'AddOns');
-  cfg.inboxFile = path.join(cfg.addonDir, 'WoWClaude', 'Inbox.lua');
-  cfg.savedVariablesFile = path.join(client, 'WTF', 'Account', account, 'SavedVariables', 'WoWClaude.lua');
+  cfg.inboxFile = path.join(cfg.addonDir, 'WoWWhatsApp', 'Inbox.lua');
+  cfg.savedVariablesFile = path.join(client, 'WTF', 'Account', account, 'SavedVariables', 'WoWWhatsApp.lua');
   cfg.defaultCwd = args.project ? path.resolve(args.project) : process.cwd();
   const exe = fs.readdirSync(client).find(f => /^Wow.*\.exe$/i.test(f));
   if (exe) cfg.capture.processName = exe.replace(/\.exe$/i, '');
@@ -98,16 +98,16 @@ try {
   const { dest, copied } = copyAddon(client);
   console.log(`addon    : ${copied} file(s) -> ${dest}`);
   const cfg = writeConfig(client, account);
-  console.log(`project  : ${cfg.defaultCwd}  (change with /wow-claude cd in game, or defaultCwd in config.json)`);
+  console.log(`project  : ${cfg.defaultCwd}  (change with /wow-whatsapp cd in game, or defaultCwd in config.json)`);
   console.log('slots    : building the reply-slot pool and signal files...');
   const r = spawnSync(process.execPath, [path.join(BRIDGE, 'install-slots.js')], { stdio: 'inherit' });
   if (r.status !== 0) throw new Error('install-slots.js failed');
   console.log(`
 Done. Next:
   1. Fully quit and relaunch World of Warcraft (it only discovers new addon files at launch).
-  2. Enable "WoW Claude" at the character select AddOns screen (the WoW Claude slot ### entries stay enabled).
+  2. Enable "WoW WhatsApp" at the character select AddOns screen (the WoW WhatsApp slot ### entries stay enabled).
   3. Start the bridge:  npm start   (in this terminal; bridge\\start-window.cmd opens its own window)
-  4. In game:  /wow-claude
+  4. In game:  /wow-whatsapp
 `);
 } catch (e) {
   console.error('setup failed:', e.message);

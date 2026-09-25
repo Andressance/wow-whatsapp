@@ -1,0 +1,10 @@
+## Interface: 120100
+## Title: WoW WhatsApp
+## Notes: Chat with WhatsApp contacts and groups from inside the game. Needs the companion bridge (see README).
+## Author: chelinho139
+## Version: 0.3.0
+## SavedVariables: WoWWhatsAppDB
+
+Codec.lua
+Inbox.lua
+WoWWhatsApp.lua

@@ -6,7 +6,7 @@ const { lua, lauxlib, lualib, to_luastring, to_jsstring } = fengari;
 const fs = require('fs'), path = require('path'), zlib = require('zlib');
 const { execFileSync } = require('child_process');
 
-const CODEC = path.join(__dirname, '..', 'addon', 'WoWClaude', 'Codec.lua');
+const CODEC = path.join(__dirname, '..', 'addon', 'WoWWhatsApp', 'Codec.lua');
 const CAPTURE = path.join(__dirname, '..', 'bridge', 'capture.ps1');
 const TMP = path.join(__dirname, 'tmp');
 const CELL = 4, CELLS = 200, MAXROWS = 48;
@@ -18,7 +18,7 @@ function encodeWithLua(id, payload) {
   const L = lauxlib.luaL_newstate();
   lualib.luaL_openlibs(L);
   const code = fs.readFileSync(CODEC, 'utf8') +
-    `\nlocal cells, n = WoWClaude_Codec.Encode(${id}, ${lit})\n` +
+    `\nlocal cells, n = WoWWhatsApp_Codec.Encode(${id}, ${lit})\n` +
     `local t = {}\nfor i = 1, #cells do t[i] = string.format("%d", cells[i]) end\n` +
     `RESULT = table.concat(t, ",")\n`;
   if (lauxlib.luaL_dostring(L, to_luastring(code)) !== 0) {

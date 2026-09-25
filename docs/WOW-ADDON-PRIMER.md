@@ -1,10 +1,10 @@
 # WoW: Forever addon and macro primer
 
-Read by the wow-claude bridge and appended to Claude's system prompt on every run (see `primerFile` in docs/CONFIGURATION.md). Keep it short: it costs tokens on every message. Edit it freely; the bridge re-reads it on each run.
+Read by the wow-whatsapp bridge and appended to WhatsApp's system prompt on every run (see `primerFile` in docs/CONFIGURATION.md). Keep it short: it costs tokens on every message. Edit it freely; the bridge re-reads it on each run.
 
 ## The client
 
-- World of Warcraft: Forever is vanilla content on the current retail engine and UI code (the `Mainline` files, with 12.x-era deprecation shims). Interface number 16001 (client 1.60.x). Lua 5.1.
+- World of Warcraft: Forever uses the current 12.x UI engine. Interface number 120100. Lua 5.1.
 - Blizzard's own UI code for this client is the `forever` branch of https://github.com/Gethe/wow-ui-source. When unsure whether a function, frame template or global exists, check there, or in game: `/dump type(SomeFunction)`, `/run print(GetBuildInfo())`.
 - Use the modern `C_` namespaces; many old globals are gone or only exist as temporary shims: `C_Item.GetItemInfo` (not `GetItemInfo`), `C_Spell.GetSpellInfo` / `C_Spell.GetSpellCooldown` (return tables, not multiple values), `C_UnitAuras.GetAuraDataByIndex(unit, i, "HELPFUL")` (not `UnitBuff`), `C_Container.GetContainerNumSlots` / `GetContainerItemInfo` (returns a table), `C_AddOns`, `C_Timer`, `C_Map`. Write a fallback only if you have confirmed the old name exists: `local f = (C_Item and C_Item.GetItemInfo) or GetItemInfo`. Vanilla-era systems (talent tabs, skill lines, weapon skills) keep the classic functions: `GetTalentTabInfo`, `GetTalentInfo(tab, i)`, `GetNumSkillLines`, `GetSkillLineInfo(i)`; verify in game.
 - Beta quirk: the client sometimes wipes addon SavedVariables. Do not keep anything irreplaceable only there.
@@ -13,7 +13,7 @@ Read by the wow-claude bridge and appended to Claude's system prompt on every ru
 
 - `Interface\AddOns\<Name>\<Name>.toc` lists the files, in load order:
   ```
-  ## Interface: 16001
+  ## Interface: 120100
   ## Title: My Addon
   ## Notes: What it does
   ## SavedVariables: MyAddonDB
@@ -67,4 +67,4 @@ SLASH_MYADDON1 = "/myaddon"; SlashCmdList.MYADDON = function(msg) end
 ## Debugging in game
 
 - `/reload` after editing Lua; `/console scriptErrors 1` to see Lua errors; `/dump expr` to print a value; `/etrace` to watch events; `/fstack` to find the frame under the mouse; `/run` for one-liners.
-- With wow-claude, the player is reading your reply in a small in-game window: give the file path and a short "what to do next" (`/reload`, or restart the client if you added a file).
+- With wow-whatsapp, the player is reading your reply in a small in-game window: give the file path and a short "what to do next" (`/reload`, or restart the client if you added a file).

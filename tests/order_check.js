@@ -7,9 +7,9 @@ const fs = require('fs');
 const path = require('path');
 const luaparse = require('luaparse');
 
-const ADDON = process.argv[2] || path.join(__dirname, '..', 'addon', 'WoWClaude');
+const ADDON = process.argv[2] || path.join(__dirname, '..', 'addon', 'WoWWhatsApp');
 let bad = 0;
-for (const f of ['Codec.lua', 'WoWClaude.lua', 'Inbox.lua']) {
+for (const f of ['Codec.lua', 'WoWWhatsApp.lua', 'Inbox.lua']) {
   const src = fs.readFileSync(path.join(ADDON, f), 'utf8');
   luaparse.parse(src, { luaVersion: '5.1' });
   console.log('OK   ' + f + ' parses');

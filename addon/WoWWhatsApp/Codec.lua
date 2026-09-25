@@ -1,4 +1,4 @@
--- WoWClaude pixel codec. Pure Lua, no WoW APIs, so it can be tested outside the game.
+-- WoWWhatsApp pixel codec. Pure Lua, no WoW APIs, so it can be tested outside the game.
 --
 -- A message is a byte stream:
 --   [0xC7 0x1A] [id hi, id lo] [len hi, len lo] [payload: len bytes] [fletcher s1, s2]
@@ -7,8 +7,8 @@
 -- off (bit 2 = R, bit 1 = G, bit 0 = B). Pure primaries survive any gamma/contrast
 -- setting, unlike intermediate levels. bridge/capture.ps1 decodes it.
 
-WoWClaude_Codec = {}
-local C = WoWClaude_Codec
+WoWWhatsApp_Codec = {}
+local C = WoWWhatsApp_Codec
 
 C.MAGIC1, C.MAGIC2 = 0xC7, 0x1A
 C.BITS = 3

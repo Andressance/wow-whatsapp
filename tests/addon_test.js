@@ -1,4 +1,4 @@
-// Runs the real addon Lua (Codec.lua + WoWClaude.lua) in a Lua VM with a stub
+// Runs the real addon Lua (Codec.lua + WoWWhatsApp.lua) in a Lua VM with a stub
 // WoW API (wow_stub.lua) and drives it through a session: login, hello, a sent
 // message read back off the pixel strip, a reply delivered through a slot, the
 // bridge's default folder, a permission denial with Allow, and a restore.
@@ -10,7 +10,7 @@ const path = require('path');
 const fengari = require('fengari');
 const { lua, lauxlib, lualib, to_luastring, to_jsstring } = fengari;
 
-const ADDON = path.join(__dirname, '..', 'addon', 'WoWClaude');
+const ADDON = path.join(__dirname, '..', 'addon', 'WoWWhatsApp');
 const CELLS_PER_ROW = 200;
 
 function newVM() {
@@ -33,17 +33,17 @@ function newVM() {
   };
   const num = (expr) => Number(evaluate(expr));
   run(fs.readFileSync(path.join(__dirname, 'wow_stub.lua'), 'utf8'));
-  for (const f of ['Codec.lua', 'Inbox.lua', 'WoWClaude.lua']) run(fs.readFileSync(path.join(ADDON, f), 'utf8'), 'WoWClaude');
+  for (const f of ['Codec.lua', 'Inbox.lua', 'WoWWhatsApp.lua']) run(fs.readFileSync(path.join(ADDON, f), 'utf8'), 'WoWWhatsApp');
   return { run, evaluate, num };
 }
 
 // Read the strip the addon drew, exactly like capture.ps1: 3 bits per cell,
 // [C7 1A] [id] [len] [payload] [fletcher]. Returns { id, text } or null.
 function decodeStrip(vm) {
-  if (vm.evaluate('WoWClaudeStrip and WoWClaudeStrip.shown') !== 'true') return null;
+  if (vm.evaluate('WoWWhatsAppStrip and WoWWhatsAppStrip.shown') !== 'true') return null;
   vm.run(`
     local parts = {}
-    for _, t in ipairs(WoWClaudeStrip.textures) do
+    for _, t in ipairs(WoWWhatsAppStrip.textures) do
       if t.shown and t.color then
         local c, r = math.floor(t.x / 4), math.floor(-t.y / 4)
         local v = (t.color[1] >= 0.5 and 4 or 0) + (t.color[2] >= 0.5 and 2 or 0) + (t.color[3] >= 0.5 and 1 or 0)
@@ -82,11 +82,11 @@ function stripRecords(vm) {
 
 // Make the next LoadAddOn deliver this slot data (a Lua table literal body).
 function nextSlot(vm, luaBody) {
-  vm.run(`STUB.onLoadAddOn = function(name) WoWClaude_SlotData = ${luaBody} end`);
+  vm.run(`STUB.onLoadAddOn = function(name) WoWWhatsApp_SlotData = ${luaBody} end`);
 }
 
 function login(vm) {
-  vm.run('STUB.FireEvent("ADDON_LOADED", "WoWClaude")');
+  vm.run('STUB.FireEvent("ADDON_LOADED", "WoWWhatsApp")');
   vm.run('STUB.FireEvent("PLAYER_LOGIN")');
 }
 
@@ -96,19 +96,19 @@ function connect(vm) {
   vm.run('STUB.RunTimers()'); // C_Timer.After(3, SayHello)
   nextSlot(vm, '{ now = time(), cwd = "", replies = {} }');
   vm.run('STUB.now = STUB.now + 6; STUB.Tick()'); // hello poll 5 s later
-  assert.equal(vm.evaluate('WoWClaude.IsConnected()'), 'true', 'connected after the hello slot');
+  assert.equal(vm.evaluate('WoWWhatsApp.IsConnected()'), 'true', 'connected after the hello slot');
 }
 
 test('addon loads, builds its UI and creates a first chat', () => {
   const vm = newVM();
   login(vm);
-  assert.equal(vm.num('#WoWClaudeDB.chats'), 1);
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].name'), 'Chat 1');
-  assert.equal(vm.evaluate('WoWClaudeFrame ~= nil'), 'true');
-  assert.equal(vm.evaluate('WoWClaudeMini ~= nil'), 'true');
+  assert.equal(vm.num('#WoWWhatsAppDB.chats'), 1);
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[1].name'), 'Chat 1');
+  assert.equal(vm.evaluate('WoWWhatsAppFrame ~= nil'), 'true');
+  assert.equal(vm.evaluate('WoWWhatsAppMini ~= nil'), 'true');
   assert.equal(vm.num('#STUB.tickers'), 1);
-  assert.equal(vm.evaluate('SlashCmdList.WOWCLAUDE ~= nil'), 'true');
-  assert.equal(vm.evaluate('SlashCmdList.CLAUDEASK ~= nil'), 'true');
+  assert.equal(vm.evaluate('SlashCmdList.WOWWHATSAPP ~= nil'), 'true');
+  assert.equal(vm.evaluate('SlashCmdList.WHATSAPPASK ~= nil'), 'true');
 });
 
 test('hello goes out on the strip after login', () => {
@@ -119,7 +119,7 @@ test('hello goes out on the strip after login', () => {
   assert.equal(recs.length, 1);
   assert.equal(recs[0].flags, 'h;c', 'a hello always carries the game context');
   assert.equal(recs[0].text, '');
-  assert.equal(recs[0].session, vm.evaluate('WoWClaudeDB.session'));
+  assert.equal(recs[0].session, vm.evaluate('WoWWhatsAppDB.session'));
 });
 
 test('the game context describes the character and rides on the hello, then only when it changes or is turned off', () => {
@@ -128,7 +128,7 @@ test('the game context describes the character and rides on the hello, then only
   vm.run('STUB.RunTimers()');
   const hello = stripRecords(vm)[0];
   assert.deepEqual(hello.ctx.split('\n'), [
-    'Game: World of Warcraft: Forever (client 1.60.1.69913, interface 16001)',
+    'Game: World of Warcraft: Forever (client 12.1.0.120100, interface 120100)',
     'Character: Testchar on Test Realm, level 23 Night Elf Hunter (Alliance), guild <Test Guild>',
     'Location: Duskwood - Darkshire',
     'Position: 45.2, 67.8 (map 1431)',
@@ -139,32 +139,32 @@ test('the game context describes the character and rides on the hello, then only
   // The bridge answers the hello: the context is now known to be on its side.
   nextSlot(vm, '{ now = time(), cwd = "", replies = {} }');
   vm.run('STUB.now = STUB.now + 6; STUB.Tick()');
-  assert.equal(vm.evaluate('WoWClaude.IsConnected()'), 'true');
-  vm.run('WoWClaude.Send("hello world")');
+  assert.equal(vm.evaluate('WoWWhatsApp.IsConnected()'), 'true');
+  vm.run('WoWWhatsApp.Send("hello world")');
   let rec = stripRecords(vm).find(r => r.text === 'hello world');
   assert.equal(rec.flags, '', 'unchanged context is not repeated');
   assert.equal(rec.ctx, undefined);
-  assert.equal(vm.evaluate('WoWClaudeDB.outbox.ctx'), null);
+  assert.equal(vm.evaluate('WoWWhatsAppDB.outbox.ctx'), null);
   // Moving to another zone changes it, so the next message (from another chat,
   // the first one is still waiting) carries the new version.
-  vm.run('STUB.zone = "Elwynn Forest"; STUB.subzone = ""; STUB.posX = 0.1; WoWClaude.NewChat("Second"); WoWClaude.Send("where am I")');
+  vm.run('STUB.zone = "Elwynn Forest"; STUB.subzone = ""; STUB.posX = 0.1; WoWWhatsApp.NewChat("Second"); WoWWhatsApp.Send("where am I")');
   rec = stripRecords(vm).find(r => r.text === 'where am I');
   assert.equal(rec.flags, 'c');
   assert.ok(rec.ctx.includes('Location: Elwynn Forest\n'), rec.ctx);
   assert.ok(rec.ctx.includes('Position: 10.0, 67.8 on Duskwood (map 1431)'), 'the map name shows when it differs from the zone');
-  assert.equal(Buffer.from(vm.evaluate('WoWClaudeDB.outbox.ctx'), 'hex').toString('utf8'), rec.ctx, 'the reload path carries it too');
+  assert.equal(Buffer.from(vm.evaluate('WoWWhatsAppDB.outbox.ctx'), 'hex').toString('utf8'), rec.ctx, 'the reload path carries it too');
   // Turning it off sends an empty context at once (a hello), so the bridge drops what it had.
-  vm.run('SlashCmdList.WOWCLAUDE("context off")');
-  assert.equal(vm.evaluate('WoWClaudeDB.settings.context'), 'false');
+  vm.run('SlashCmdList.WOWWHATSAPP("context off")');
+  assert.equal(vm.evaluate('WoWWhatsAppDB.settings.context'), 'false');
   const off = stripRecords(vm).filter(r => r.flags === 'h;c');
   assert.equal(off.length, 1);
   assert.equal(off[0].ctx, '');
-  assert.ok(vm.evaluate('WoWClaudeDB.chats[2].history[#WoWClaudeDB.chats[2].history].text').includes('Game context is OFF'));
+  assert.ok(vm.evaluate('WoWWhatsAppDB.chats[2].history[#WoWWhatsAppDB.chats[2].history].text').includes('Game context is OFF'));
   // Back on: another hello, with the context again.
-  vm.run('SlashCmdList.WOWCLAUDE("context on")');
+  vm.run('SlashCmdList.WOWWHATSAPP("context on")');
   const on = stripRecords(vm).filter(r => r.flags === 'h;c');
   assert.ok(on.some(r => r.ctx.includes('Character: Testchar')));
-  assert.ok(vm.evaluate('WoWClaudeDB.chats[2].history[#WoWClaudeDB.chats[2].history].text').includes('Game context is ON'));
+  assert.ok(vm.evaluate('WoWWhatsAppDB.chats[2].history[#WoWWhatsAppDB.chats[2].history].text').includes('Game context is ON'));
 });
 
 test('a shift-clicked link lands in the focused input and is sent as its name plus tooltip', () => {
@@ -174,16 +174,16 @@ test('a shift-clicked link lands in the focused input and is sent as its name pl
   const link = '|cff1eff00|Hitem:2140:0:0:0:0:0:0:0:60:0:0|h[Fine Longsword]|h|r';
   vm.run(`STUB.tooltips["item:2140:0:0:0:0:0:0:0:60:0:0"] = { "Fine Longsword", { "Main Hand", "Sword" }, { "17 - 33 Damage", "Speed 2.70" }, "Requires Level 14" }`);
   // Without focus the link is left alone (shift-click keeps its normal meaning).
-  vm.run(`WoWClaudeInput:SetText("is this good for me? "); WoWClaudeInput:ClearFocus(); ChatFrameUtil.InsertLink("${link}")`);
-  assert.equal(vm.evaluate('WoWClaudeInput:GetText()'), 'is this good for me? ');
+  vm.run(`WoWWhatsAppInput:SetText("is this good for me? "); WoWWhatsAppInput:ClearFocus(); ChatFrameUtil.InsertLink("${link}")`);
+  assert.equal(vm.evaluate('WoWWhatsAppInput:GetText()'), 'is this good for me? ');
   // The client's own path (bags, spellbook, quest log all end here): ChatFrameUtil.InsertLink.
-  vm.run(`WoWClaudeInput:SetFocus(); ChatFrameUtil.InsertLink("${link}")`);
-  assert.equal(vm.evaluate('WoWClaudeInput:GetText()'), 'is this good for me? ' + link);
+  vm.run(`WoWWhatsAppInput:SetFocus(); ChatFrameUtil.InsertLink("${link}")`);
+  assert.equal(vm.evaluate('WoWWhatsAppInput:GetText()'), 'is this good for me? ' + link);
   // The old global name is not hooked as well, so nothing is inserted twice.
   vm.run(`ChatEdit_InsertLink("${link}")`);
-  assert.equal(vm.evaluate('WoWClaudeInput:GetText()'), 'is this good for me? ' + link + link, 'the alias reaches the one hook exactly once');
-  vm.run(`WoWClaudeInput:SetText("is this good for me? ${link}")`);
-  vm.run('WoWClaude.SendFromInput()');
+  assert.equal(vm.evaluate('WoWWhatsAppInput:GetText()'), 'is this good for me? ' + link + link, 'the alias reaches the one hook exactly once');
+  vm.run(`WoWWhatsAppInput:SetText("is this good for me? ${link}")`);
+  vm.run('WoWWhatsApp.SendFromInput()');
   const expected = [
     'is this good for me? [Fine Longsword]',
     '',
@@ -196,12 +196,12 @@ test('a shift-clicked link lands in the focused input and is sent as its name pl
   ].join('\n');
   const rec = stripRecords(vm).find(r => r.text.startsWith('is this good'));
   assert.equal(rec.text, expected);
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].history[#WoWClaudeDB.chats[1].history].text'), expected, 'the transcript shows what was sent');
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].name'), 'Is this good for me');
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[1].history[#WoWWhatsAppDB.chats[1].history].text'), expected, 'the transcript shows what was sent');
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[1].name'), 'Is this good for me');
   // Bare links (no colour) and repeated links: one block each, tooltip or not.
-  vm.run('RESULT = (WoWClaude.ExpandLinks("x |Hspell:1978|h[Serpent Sting]|h y |Hspell:1978|h[Serpent Sting]|h"))');
+  vm.run('RESULT = (WoWWhatsApp.ExpandLinks("x |Hspell:1978|h[Serpent Sting]|h y |Hspell:1978|h[Serpent Sting]|h"))');
   assert.equal(vm.evaluate('RESULT'), 'x [Serpent Sting] y [Serpent Sting]\n\n--- Linked from the game ---\n[Serpent Sting] spell 1978');
-  vm.run('RESULT, COUNT = WoWClaude.ExpandLinks("plain text | with a pipe")');
+  vm.run('RESULT, COUNT = WoWWhatsApp.ExpandLinks("plain text | with a pipe")');
   assert.equal(vm.evaluate('RESULT'), 'plain text | with a pipe');
   assert.equal(vm.evaluate('COUNT'), '0');
 });
@@ -210,40 +210,40 @@ test('deleting a chat tells the bridge to forget it, and a restore never brings 
   const vm = newVM();
   login(vm);
   connect(vm);
-  vm.run('WoWClaude.NewChat("Second")');
-  assert.equal(vm.num('#WoWClaudeDB.chats'), 2);
-  const gone = vm.evaluate('WoWClaudeDB.chats[2].id');
-  vm.run(`WoWClaude.DeleteChat("${gone}")`);
-  assert.equal(vm.num('#WoWClaudeDB.chats'), 1);
+  vm.run('WoWWhatsApp.NewChat("Second")');
+  assert.equal(vm.num('#WoWWhatsAppDB.chats'), 2);
+  const gone = vm.evaluate('WoWWhatsAppDB.chats[2].id');
+  vm.run(`WoWWhatsApp.DeleteChat("${gone}")`);
+  assert.equal(vm.num('#WoWWhatsAppDB.chats'), 1);
   // A forget record for that chat is on the strip and remembered until acked.
   const rec = stripRecords(vm).find(r => r.flags === 'd');
   assert.ok(rec, 'forget record on the strip');
   assert.equal(rec.chat, gone);
   assert.equal(rec.text, '');
-  assert.equal(vm.evaluate(`WoWClaudeDB.forget["${gone}"] ~= nil`), 'true');
+  assert.equal(vm.evaluate(`WoWWhatsAppDB.forget["${gone}"] ~= nil`), 'true');
   // A restore that still lists the chat is ignored for it.
-  const token = vm.evaluate('WoWClaudeDB.session');
+  const token = vm.evaluate('WoWWhatsAppDB.session');
   nextSlot(vm, `{ now = time(), cwd = "", replies = {}, restore = { token = "${token}", chats = { { id = "${gone}", name = "Second", cwd = "", messages = { { role = "user", text = "old", id = 1, t = 1 } } } } } }`);
-  vm.run('WoWClaude.Connect(); STUB.now = STUB.now + 6; STUB.Tick()');
-  assert.equal(vm.num('#WoWClaudeDB.chats'), 1, 'deleted chat not restored');
+  vm.run('WoWWhatsApp.Connect(); STUB.now = STUB.now + 6; STUB.Tick()');
+  assert.equal(vm.num('#WoWWhatsAppDB.chats'), 1, 'deleted chat not restored');
   // The bridge acks the forget record: it leaves the strip and the memory.
   const slot = String(rec.id).padStart(3, '0');
-  vm.run(`STUB.sounds["Interface\\\\AddOns\\\\WoWClaude\\\\ack\\\\${slot}.wav"] = true; STUB.Tick()`);
-  assert.equal(vm.evaluate(`WoWClaudeDB.forget["${gone}"]`), null, 'forgotten once acked');
+  vm.run(`STUB.sounds["Interface\\\\AddOns\\\\WoWWhatsApp\\\\ack\\\\${slot}.wav"] = true; STUB.Tick()`);
+  assert.equal(vm.evaluate(`WoWWhatsAppDB.forget["${gone}"]`), null, 'forgotten once acked');
   assert.ok(!stripRecords(vm).find(r => r.flags === 'd'), 'forget record left the strip');
 });
 
 test('until the bridge answers, Connect replaces Send and a message stays in the box', () => {
   const vm = newVM();
   login(vm);
-  vm.run('WoWClaude.Toggle(true)');
-  assert.equal(vm.evaluate('WoWClaude.IsConnected()'), 'false');
+  vm.run('WoWWhatsApp.Toggle(true)');
+  assert.equal(vm.evaluate('WoWWhatsApp.IsConnected()'), 'false');
   const texts = () => vm.evaluate('table.concat(STUB.texts, "|")');
   assert.ok(texts().includes('Not connected - start the bridge, then click Connect'));
   // Sending while disconnected puts the text back in the box and starts a connect attempt.
-  vm.run('WoWClaudeInput:SetText("fix the bug"); WoWClaude.SendFromInput()');
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].pendingId'), null, 'nothing sent');
-  assert.equal(vm.evaluate('WoWClaudeInput:GetText()'), 'fix the bug', 'message kept in the box');
+  vm.run('WoWWhatsAppInput:SetText("fix the bug"); WoWWhatsApp.SendFromInput()');
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[1].pendingId'), null, 'nothing sent');
+  assert.equal(vm.evaluate('WoWWhatsAppInput:GetText()'), 'fix the bug', 'message kept in the box');
   const hello = stripRecords(vm);
   assert.equal(hello.length, 1);
   assert.equal(hello[0].flags, 'h;c', 'a hello went out instead');
@@ -251,36 +251,36 @@ test('until the bridge answers, Connect replaces Send and a message stays in the
   assert.ok(texts().includes('your message goes out as soon as it answers'));
   // No answer within CONNECT_WAIT: the attempt is reported as failed, Connect is back.
   vm.run('STUB.now = STUB.now + 20; STUB.Tick()');
-  assert.equal(vm.evaluate('WoWClaude.IsConnected()'), 'false');
+  assert.equal(vm.evaluate('WoWWhatsApp.IsConnected()'), 'false');
   assert.ok(texts().includes('No answer from the bridge'));
-  assert.equal(vm.evaluate('WoWClaudeInput:GetText()'), 'fix the bug', 'message still in the box after a failed attempt');
+  assert.equal(vm.evaluate('WoWWhatsAppInput:GetText()'), 'fix the bug', 'message still in the box after a failed attempt');
   // Click Connect again; this time the bridge answers the hello poll. Nothing was
   // queued by that click, so the message waits for the user.
-  vm.run('WoWClaude.Connect()');
+  vm.run('WoWWhatsApp.Connect()');
   nextSlot(vm, '{ now = time(), cwd = "C:\\\\proj", replies = {} }');
   vm.run('STUB.now = STUB.now + 6; STUB.Tick()');
-  assert.equal(vm.evaluate('WoWClaude.IsConnected()'), 'true');
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].pendingId'), null, 'a plain Connect sends nothing by itself');
-  vm.run('WoWClaude.SendFromInput()');
-  assert.ok(vm.num('WoWClaudeDB.chats[1].pendingId') >= 1, 'the kept message goes out once connected');
+  assert.equal(vm.evaluate('WoWWhatsApp.IsConnected()'), 'true');
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[1].pendingId'), null, 'a plain Connect sends nothing by itself');
+  vm.run('WoWWhatsApp.SendFromInput()');
+  assert.ok(vm.num('WoWWhatsAppDB.chats[1].pendingId') >= 1, 'the kept message goes out once connected');
   assert.ok(stripRecords(vm).find(r => r.text === 'fix the bug'));
 });
 
 test('a message sent while disconnected goes out by itself once the bridge answers', () => {
   const vm = newVM();
   login(vm);
-  vm.run('WoWClaude.Toggle(true)');
-  vm.run('WoWClaudeInput:SetText("fix the bug"); WoWClaude.SendFromInput()');
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].pendingId'), null, 'nothing sent yet');
+  vm.run('WoWWhatsApp.Toggle(true)');
+  vm.run('WoWWhatsAppInput:SetText("fix the bug"); WoWWhatsApp.SendFromInput()');
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[1].pendingId'), null, 'nothing sent yet');
   // The bridge answers the hello poll: the queued message follows without a second click.
   nextSlot(vm, '{ now = time(), cwd = "C:\\\\proj", replies = {} }');
   vm.run('STUB.now = STUB.now + 6; STUB.Tick()');
-  assert.equal(vm.evaluate('WoWClaude.IsConnected()'), 'true');
-  assert.ok(vm.num('WoWClaudeDB.chats[1].pendingId') >= 1, 'queued message went out on connect');
+  assert.equal(vm.evaluate('WoWWhatsApp.IsConnected()'), 'true');
+  assert.ok(vm.num('WoWWhatsAppDB.chats[1].pendingId') >= 1, 'queued message went out on connect');
   assert.ok(stripRecords(vm).find(r => r.text === 'fix the bug'));
-  assert.equal(vm.evaluate('WoWClaudeInput:GetText()'), '', 'box cleared after the auto-send');
+  assert.equal(vm.evaluate('WoWWhatsAppInput:GetText()'), '', 'box cleared after the auto-send');
   // Only once: a later reconnect sends nothing.
-  vm.run('WoWClaude.Connect()');
+  vm.run('WoWWhatsApp.Connect()');
   nextSlot(vm, '{ now = time(), cwd = "C:\\\\proj", replies = {} }');
   vm.run('STUB.now = STUB.now + 6; STUB.Tick()');
   assert.equal(stripRecords(vm).filter(r => r.text === 'fix the bug').length, 1);
@@ -293,54 +293,54 @@ test('without the sound channel, the light stays green between idle slot polls',
   const vm = newVM();
   login(vm);
   connect(vm);
-  assert.equal(vm.evaluate('WoWClaude.BridgeState()'), 'ok');
+  assert.equal(vm.evaluate('WoWWhatsApp.BridgeState()'), 'ok');
   // 90 s of silence used to mean "stale"; with no beats to hear that is normal.
   vm.run('STUB.now = STUB.now + 200; STUB.Tick()');
-  assert.equal(vm.evaluate('WoWClaude.BridgeState()'), 'ok', 'still green after 200 s');
-  assert.equal(vm.evaluate('WoWClaude.IsConnected()'), 'true');
+  assert.equal(vm.evaluate('WoWWhatsApp.BridgeState()'), 'ok', 'still green after 200 s');
+  assert.equal(vm.evaluate('WoWWhatsApp.IsConnected()'), 'true');
   // 10 minutes in, the idle poll spends a slot; the bridge's clock in it keeps the light green.
-  vm.run('STUB.loadCount = 0; STUB.onLoadAddOn = function(name) STUB.loadCount = STUB.loadCount + 1; WoWClaude_SlotData = { now = time(), cwd = "", replies = {} } end');
+  vm.run('STUB.loadCount = 0; STUB.onLoadAddOn = function(name) STUB.loadCount = STUB.loadCount + 1; WoWWhatsApp_SlotData = { now = time(), cwd = "", replies = {} } end');
   vm.run('STUB.now = STUB.now + 410; STUB.Tick()');
   assert.equal(vm.num('STUB.loadCount'), 1, 'one idle poll');
-  assert.equal(vm.evaluate('WoWClaude.BridgeState()'), 'ok', 'green again after the idle poll');
+  assert.equal(vm.evaluate('WoWWhatsApp.BridgeState()'), 'ok', 'green again after the idle poll');
   // A bridge that really is gone still shows: no slot answers, and the light drops.
-  vm.run('STUB.onLoadAddOn = function(name) WoWClaude_SlotData = nil end');
+  vm.run('STUB.onLoadAddOn = function(name) WoWWhatsApp_SlotData = nil end');
   vm.run('STUB.now = STUB.now + 800; STUB.Tick()');
-  assert.equal(vm.evaluate('WoWClaude.BridgeState()'), 'stale');
+  assert.equal(vm.evaluate('WoWWhatsApp.BridgeState()'), 'stale');
   vm.run('STUB.now = STUB.now + 700; STUB.Tick()');
-  assert.equal(vm.evaluate('WoWClaude.BridgeState()'), 'down');
+  assert.equal(vm.evaluate('WoWWhatsApp.BridgeState()'), 'down');
 });
 
-test('the Folder... menu item (right-click a chat) opens a prompt that sets the chat folder like /wow-claude cd', () => {
+test('the Folder... menu item (right-click a chat) opens a prompt that sets the chat folder like /wow-whatsapp cd', () => {
   const vm = newVM();
   login(vm);
-  vm.run('WoWClaude.FolderPrompt()');
-  assert.equal(vm.evaluate('STUB.popup.which'), 'WOWCLAUDE_FOLDER');
+  vm.run('WoWWhatsApp.FolderPrompt()');
+  assert.equal(vm.evaluate('STUB.popup.which'), 'WOWWHATSAPP_FOLDER');
   assert.equal(vm.evaluate('STUB.popup.data.cwd'), '');
   // Accept the dialog the way the game would: an edit box holding the new path.
   vm.run(`
     local dialog = { editBox = { GetText = function() return "  ..\\\\realms " end } }
-    StaticPopupDialogs.WOWCLAUDE_FOLDER.OnAccept(dialog, STUB.popup.data)`);
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].cwd'), '..\\realms');
-  assert.ok(vm.evaluate('WoWClaudeDB.chats[1].history[#WoWClaudeDB.chats[1].history].text').includes('relative to'));
-  vm.run('WoWClaude.FolderPrompt()');
+    StaticPopupDialogs.WOWWHATSAPP_FOLDER.OnAccept(dialog, STUB.popup.data)`);
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[1].cwd'), '..\\realms');
+  assert.ok(vm.evaluate('WoWWhatsAppDB.chats[1].history[#WoWWhatsAppDB.chats[1].history].text').includes('relative to'));
+  vm.run('WoWWhatsApp.FolderPrompt()');
   assert.equal(vm.evaluate('STUB.popup.data.cwd'), '..\\realms', 'prompt is prefilled with the current folder');
   // A full path gets no "relative to" note; empty goes back to the default.
-  vm.run('WoWClaude.SetFolder("C:\\\\other")');
-  assert.ok(!vm.evaluate('WoWClaudeDB.chats[1].history[#WoWClaudeDB.chats[1].history].text').includes('relative to'));
-  vm.run('WoWClaude.SetFolder("")');
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].cwd'), '');
+  vm.run('WoWWhatsApp.SetFolder("C:\\\\other")');
+  assert.ok(!vm.evaluate('WoWWhatsAppDB.chats[1].history[#WoWWhatsAppDB.chats[1].history].text').includes('relative to'));
+  vm.run('WoWWhatsApp.SetFolder("")');
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[1].cwd'), '');
 });
 
 test('a sent message is encoded on the strip with the chat folder, then a slot reply finishes it', () => {
   const vm = newVM();
   login(vm);
   connect(vm);
-  vm.run('SlashCmdList.WOWCLAUDE("cd realms")');
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].cwd'), 'realms');
-  vm.run('WoWClaude.Send("hello world")');
-  const chatId = vm.evaluate('WoWClaudeDB.chats[1].id');
-  const id = vm.num('WoWClaudeDB.chats[1].pendingId');
+  vm.run('SlashCmdList.WOWWHATSAPP("cd realms")');
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[1].cwd'), 'realms');
+  vm.run('WoWWhatsApp.Send("hello world")');
+  const chatId = vm.evaluate('WoWWhatsAppDB.chats[1].id');
+  const id = vm.num('WoWWhatsAppDB.chats[1].pendingId');
   assert.ok(id >= 1);
   const rec = stripRecords(vm).find(r => r.text === 'hello world');
   assert.ok(rec, 'message record on the strip');
@@ -349,164 +349,164 @@ test('a sent message is encoded on the strip with the chat folder, then a slot r
   assert.equal(rec.cwd, 'realms');
   assert.equal(rec.flags, '');
   // The chat took its title from the first message.
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].name'), 'Hello world');
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[1].name'), 'Hello world');
 
   nextSlot(vm, `{ now = time(), cwd = "C:\\\\proj", replies = { { chat = "${chatId}", id = ${id}, status = "done", text = "hi back", cwd = "x", session = "s" } } }`);
   vm.run('STUB.now = STUB.now + 6; STUB.Tick()'); // first scheduled poll is 5 s after sending
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].pendingId'), null);
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].history[#WoWClaudeDB.chats[1].history].role'), 'claude');
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].history[#WoWClaudeDB.chats[1].history].text'), 'hi back');
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[1].pendingId'), null);
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[1].history[#WoWWhatsAppDB.chats[1].history].role'), 'whatsapp');
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[1].history[#WoWWhatsAppDB.chats[1].history].text'), 'hi back');
   assert.ok(vm.evaluate('table.concat(STUB.prints, "\\n")').includes('hi back'), 'reply echoed to the game chat');
-  assert.equal(vm.evaluate('WoWClaudeStrip.shown'), 'false', 'strip cleared once nothing is pending');
+  assert.equal(vm.evaluate('WoWWhatsAppStrip.shown'), 'false', 'strip cleared once nothing is pending');
 
-  // The bridge's default folder arrived with the slot and is what "/wow-claude cd" reports.
-  vm.run('SlashCmdList.WOWCLAUDE("cd")');
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].cwd'), '');
-  assert.ok(vm.evaluate('WoWClaudeDB.chats[1].history[#WoWClaudeDB.chats[1].history].text').includes('C:\\proj'));
+  // The bridge's default folder arrived with the slot and is what "/wow-whatsapp cd" reports.
+  vm.run('SlashCmdList.WOWWHATSAPP("cd")');
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[1].cwd'), '');
+  assert.ok(vm.evaluate('WoWWhatsAppDB.chats[1].history[#WoWWhatsAppDB.chats[1].history].text').includes('C:\\proj'));
 });
 
 test('a denied reply shows Allow, and Allow resends with the rules as flags', () => {
   const vm = newVM();
   login(vm);
   connect(vm);
-  vm.run('WoWClaude.Send("search for it")');
-  const chatId = vm.evaluate('WoWClaudeDB.chats[1].id');
-  const id = vm.num('WoWClaudeDB.chats[1].pendingId');
+  vm.run('WoWWhatsApp.Send("search for it")');
+  const chatId = vm.evaluate('WoWWhatsAppDB.chats[1].id');
+  const id = vm.num('WoWWhatsAppDB.chats[1].pendingId');
   nextSlot(vm, `{ now = time(), cwd = "", replies = { { chat = "${chatId}", id = ${id}, status = "done", text = "need permission", denied = { "WebSearch", "Bash(cargo:*)" } } } }`);
   vm.run('STUB.now = STUB.now + 6; STUB.Tick()');
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].history[#WoWClaudeDB.chats[1].history].denied[2]'), 'Bash(cargo:*)');
-  vm.run(`WoWClaude.Allow("${chatId}", { "WebSearch", "Bash(cargo:*)" })`);
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[1].history[#WoWWhatsAppDB.chats[1].history].denied[2]'), 'Bash(cargo:*)');
+  vm.run(`WoWWhatsApp.Allow("${chatId}", { "WebSearch", "Bash(cargo:*)" })`);
   const rec = stripRecords(vm).find(r => r.flags.includes('allow='));
   assert.ok(rec, 'allow record on the strip');
   assert.equal(rec.flags, 'allow=WebSearch,Bash(cargo:*)');
   assert.equal(rec.id, id + 1);
 });
 
-test('/wow-claude reset marks the next message as a new session', () => {
+test('/wow-whatsapp reset marks the next message as a new session', () => {
   const vm = newVM();
   login(vm);
   connect(vm);
-  vm.run('SlashCmdList.WOWCLAUDE("reset")');
-  vm.run('WoWClaude.Send("start over")');
+  vm.run('SlashCmdList.WOWWHATSAPP("reset")');
+  vm.run('WoWWhatsApp.Send("start over")');
   const rec = stripRecords(vm).find(r => r.text === 'start over');
   assert.equal(rec.flags, 'n');
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].resetNext'), null);
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[1].resetNext'), null);
 });
 
 test('a restore bundle addressed to this session adds the missing chats once', () => {
   const vm = newVM();
   login(vm);
   connect(vm);
-  vm.run('WoWClaude.Send("hi")');
-  const chatId = vm.evaluate('WoWClaudeDB.chats[1].id');
-  const id = vm.num('WoWClaudeDB.chats[1].pendingId');
-  const token = vm.evaluate('WoWClaudeDB.session');
-  const bundle = `restore = { token = "${token}", chats = { { id = "old1", name = "Old work", cwd = "C:\\\\old", messages = { { role = "user", id = 1, t = 1, text = "q" }, { role = "claude", id = 1, t = 2, text = "a" } } } } }`;
+  vm.run('WoWWhatsApp.Send("hi")');
+  const chatId = vm.evaluate('WoWWhatsAppDB.chats[1].id');
+  const id = vm.num('WoWWhatsAppDB.chats[1].pendingId');
+  const token = vm.evaluate('WoWWhatsAppDB.session');
+  const bundle = `restore = { token = "${token}", chats = { { id = "old1", name = "Old work", cwd = "C:\\\\old", messages = { { role = "user", id = 1, t = 1, text = "q" }, { role = "whatsapp", id = 1, t = 2, text = "a" } } } } }`;
   nextSlot(vm, `{ now = time(), cwd = "", replies = { { chat = "${chatId}", id = ${id}, status = "done", text = "ok" } }, ${bundle} }`);
   vm.run('STUB.now = STUB.now + 6; STUB.Tick()');
-  assert.equal(vm.num('#WoWClaudeDB.chats'), 2);
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].id'), 'old1');
-  assert.equal(vm.num('#WoWClaudeDB.chats[1].history'), 2);
-  assert.equal(vm.evaluate('WoWClaudeDB.restored'), 'true');
+  assert.equal(vm.num('#WoWWhatsAppDB.chats'), 2);
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[1].id'), 'old1');
+  assert.equal(vm.num('#WoWWhatsAppDB.chats[1].history'), 2);
+  assert.equal(vm.evaluate('WoWWhatsAppDB.restored'), 'true');
   // A second bundle with the same token is ignored.
-  vm.run('WoWClaude.Send("again")');
-  const id2 = vm.num('WoWClaudeDB.chats[2].pendingId');
+  vm.run('WoWWhatsApp.Send("again")');
+  const id2 = vm.num('WoWWhatsAppDB.chats[2].pendingId');
   nextSlot(vm, `{ now = time(), cwd = "", replies = { { chat = "${chatId}", id = ${id2}, status = "done", text = "ok" } }, ${bundle.replace('old1', 'old2')} }`);
   vm.run('STUB.now = STUB.now + 6; STUB.Tick()');
-  assert.equal(vm.num('#WoWClaudeDB.chats'), 2);
+  assert.equal(vm.num('#WoWWhatsAppDB.chats'), 2);
 });
 
 test('chat management commands: new, chat, rename, delete, clear, copy', () => {
   const vm = newVM();
   login(vm);
-  vm.run('SlashCmdList.WOWCLAUDE("new Realms")');
-  assert.equal(vm.num('#WoWClaudeDB.chats'), 2);
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[2].name'), 'Realms');
-  assert.equal(vm.evaluate('WoWClaudeDB.activeChat'), vm.evaluate('WoWClaudeDB.chats[2].id'));
-  vm.run('SlashCmdList.WOWCLAUDE("chat 1")');
-  assert.equal(vm.evaluate('WoWClaudeDB.activeChat'), vm.evaluate('WoWClaudeDB.chats[1].id'));
-  vm.run('SlashCmdList.WOWCLAUDE("rename Stuff")');
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].name'), 'Stuff');
-  vm.run('SlashCmdList.WOWCLAUDE("help")');
-  assert.ok(vm.evaluate('WoWClaudeDB.chats[1].history[1].text').includes('/wow-claude cd'));
-  vm.run('SlashCmdList.WOWCLAUDE("clear")');
-  assert.equal(vm.num('#WoWClaudeDB.chats[1].history'), 0);
-  vm.run('SlashCmdList.WOWCLAUDE("delete")');
-  assert.equal(vm.num('#WoWClaudeDB.chats'), 1);
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].name'), 'Realms');
+  vm.run('SlashCmdList.WOWWHATSAPP("new Realms")');
+  assert.equal(vm.num('#WoWWhatsAppDB.chats'), 2);
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[2].name'), 'Realms');
+  assert.equal(vm.evaluate('WoWWhatsAppDB.activeChat'), vm.evaluate('WoWWhatsAppDB.chats[2].id'));
+  vm.run('SlashCmdList.WOWWHATSAPP("chat 1")');
+  assert.equal(vm.evaluate('WoWWhatsAppDB.activeChat'), vm.evaluate('WoWWhatsAppDB.chats[1].id'));
+  vm.run('SlashCmdList.WOWWHATSAPP("rename Stuff")');
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[1].name'), 'Stuff');
+  vm.run('SlashCmdList.WOWWHATSAPP("help")');
+  assert.ok(vm.evaluate('WoWWhatsAppDB.chats[1].history[1].text').includes('/wow-whatsapp cd'));
+  vm.run('SlashCmdList.WOWWHATSAPP("clear")');
+  assert.equal(vm.num('#WoWWhatsAppDB.chats[1].history'), 0);
+  vm.run('SlashCmdList.WOWWHATSAPP("delete")');
+  assert.equal(vm.num('#WoWWhatsAppDB.chats'), 1);
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[1].name'), 'Realms');
   // The copy box builds with a proper backdrop (the stub fails on SetBackdrop(nil)).
-  vm.run('WoWClaude.ShowCopy("some reply")');
-  assert.equal(vm.evaluate('WoWClaudeCopy.shown'), 'true');
-  assert.equal(vm.evaluate('WoWClaudeCopyBox.text'), 'some reply');
+  vm.run('WoWWhatsApp.ShowCopy("some reply")');
+  assert.equal(vm.evaluate('WoWWhatsAppCopy.shown'), 'true');
+  assert.equal(vm.evaluate('WoWWhatsAppCopyBox.text'), 'some reply');
 });
 
 test('chat rows: right-click opens a menu that renames or sets the folder of that chat, the trash can asks before deleting', () => {
   const vm = newVM();
   login(vm);
-  vm.run('SlashCmdList.WOWCLAUDE("new Realms")');
-  const first = vm.evaluate('WoWClaudeDB.chats[1].id');
-  const second = vm.evaluate('WoWClaudeDB.chats[2].id');
-  assert.equal(vm.evaluate('WoWClaudeDB.activeChat'), second);
+  vm.run('SlashCmdList.WOWWHATSAPP("new Realms")');
+  const first = vm.evaluate('WoWWhatsAppDB.chats[1].id');
+  const second = vm.evaluate('WoWWhatsAppDB.chats[2].id');
+  assert.equal(vm.evaluate('WoWWhatsAppDB.activeChat'), second);
   // The menu opens for the row's chat, not the active one, and toggles closed on a second open.
-  vm.run(`WoWClaude.ShowChatMenu("${first}", WoWClaudeFrame)`);
-  assert.equal(vm.evaluate('WoWClaudeChatMenu.shown'), 'true');
-  assert.equal(vm.evaluate('WoWClaudeChatMenu.chatId'), first);
-  assert.equal(vm.evaluate('WoWClaudeChatMenu.title.text'), 'Chat 1');
-  vm.run(`WoWClaude.ShowChatMenu("${first}", WoWClaudeFrame)`);
-  assert.equal(vm.evaluate('WoWClaudeChatMenu.shown'), 'false');
+  vm.run(`WoWWhatsApp.ShowChatMenu("${first}", WoWWhatsAppFrame)`);
+  assert.equal(vm.evaluate('WoWWhatsAppChatMenu.shown'), 'true');
+  assert.equal(vm.evaluate('WoWWhatsAppChatMenu.chatId'), first);
+  assert.equal(vm.evaluate('WoWWhatsAppChatMenu.title.text'), 'Chat 1');
+  vm.run(`WoWWhatsApp.ShowChatMenu("${first}", WoWWhatsAppFrame)`);
+  assert.equal(vm.evaluate('WoWWhatsAppChatMenu.shown'), 'false');
   // Rename and Folder prompts target the chat they were opened for.
-  vm.run(`WoWClaude.RenamePrompt("${first}")`);
-  assert.equal(vm.evaluate('STUB.popup.which'), 'WOWCLAUDE_RENAME');
+  vm.run(`WoWWhatsApp.RenamePrompt("${first}")`);
+  assert.equal(vm.evaluate('STUB.popup.which'), 'WOWWHATSAPP_RENAME');
   assert.equal(vm.evaluate('STUB.popup.data.id'), first);
   vm.run(`
     local dialog = { editBox = { GetText = function() return "Old stuff" end } }
-    StaticPopupDialogs.WOWCLAUDE_RENAME.OnAccept(dialog, STUB.popup.data)`);
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].name'), 'Old stuff');
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[2].name'), 'Realms');
-  vm.run(`WoWClaude.FolderPrompt("${first}")`);
-  assert.equal(vm.evaluate('STUB.popup.which'), 'WOWCLAUDE_FOLDER');
+    StaticPopupDialogs.WOWWHATSAPP_RENAME.OnAccept(dialog, STUB.popup.data)`);
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[1].name'), 'Old stuff');
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[2].name'), 'Realms');
+  vm.run(`WoWWhatsApp.FolderPrompt("${first}")`);
+  assert.equal(vm.evaluate('STUB.popup.which'), 'WOWWHATSAPP_FOLDER');
   assert.equal(vm.evaluate('STUB.popup.data.id'), first);
   // The X asks first: nothing happens until OK, then only that chat goes and the active one stays.
-  vm.run(`WoWClaude.ConfirmDelete("${first}")`);
-  assert.equal(vm.evaluate('STUB.popup.which'), 'WOWCLAUDE_DELETE');
-  assert.equal(vm.num('#WoWClaudeDB.chats'), 2);
-  vm.run('StaticPopupDialogs.WOWCLAUDE_DELETE.OnAccept({}, STUB.popup.data)');
-  assert.equal(vm.num('#WoWClaudeDB.chats'), 1);
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].id'), second);
-  assert.equal(vm.evaluate('WoWClaudeDB.activeChat'), second);
+  vm.run(`WoWWhatsApp.ConfirmDelete("${first}")`);
+  assert.equal(vm.evaluate('STUB.popup.which'), 'WOWWHATSAPP_DELETE');
+  assert.equal(vm.num('#WoWWhatsAppDB.chats'), 2);
+  vm.run('StaticPopupDialogs.WOWWHATSAPP_DELETE.OnAccept({}, STUB.popup.data)');
+  assert.equal(vm.num('#WoWWhatsAppDB.chats'), 1);
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[1].id'), second);
+  assert.equal(vm.evaluate('WoWWhatsAppDB.activeChat'), second);
   // Deleting the last chat clears it instead of removing it.
-  vm.run(`WoWClaude.ConfirmDelete("${second}")`);
-  vm.run('StaticPopupDialogs.WOWCLAUDE_DELETE.OnAccept({}, STUB.popup.data)');
-  assert.equal(vm.num('#WoWClaudeDB.chats'), 1);
-  assert.equal(vm.evaluate('WoWClaudeDB.chats[1].name'), 'Chat 1');
+  vm.run(`WoWWhatsApp.ConfirmDelete("${second}")`);
+  vm.run('StaticPopupDialogs.WOWWHATSAPP_DELETE.OnAccept({}, STUB.popup.data)');
+  assert.equal(vm.num('#WoWWhatsAppDB.chats'), 1);
+  assert.equal(vm.evaluate('WoWWhatsAppDB.chats[1].name'), 'Chat 1');
 });
 
 test('minimize collapses to the mini bar and back; the mini bar X hides everything', () => {
   const vm = newVM();
   login(vm);
-  vm.run('WoWClaude.Toggle(true)');
-  assert.equal(vm.evaluate('WoWClaudeFrame.shown'), 'true');
-  vm.run('WoWClaude.Minimize(true)');
-  assert.equal(vm.evaluate('WoWClaudeFrame.shown'), 'false');
-  assert.equal(vm.evaluate('WoWClaudeMini.shown'), 'true');
-  assert.equal(vm.evaluate('WoWClaudeDB.settings.minimized'), 'true');
-  vm.run('WoWClaude.Minimize(false)');
-  assert.equal(vm.evaluate('WoWClaudeFrame.shown'), 'true');
-  assert.equal(vm.evaluate('WoWClaudeMini.shown'), 'false');
-  vm.run('WoWClaude.Toggle(false)');
-  assert.equal(vm.evaluate('WoWClaudeFrame.shown'), 'false');
-  assert.equal(vm.evaluate('WoWClaudeMini.shown'), 'false');
-  assert.equal(vm.evaluate('WoWClaudeDB.settings.shown'), 'false');
+  vm.run('WoWWhatsApp.Toggle(true)');
+  assert.equal(vm.evaluate('WoWWhatsAppFrame.shown'), 'true');
+  vm.run('WoWWhatsApp.Minimize(true)');
+  assert.equal(vm.evaluate('WoWWhatsAppFrame.shown'), 'false');
+  assert.equal(vm.evaluate('WoWWhatsAppMini.shown'), 'true');
+  assert.equal(vm.evaluate('WoWWhatsAppDB.settings.minimized'), 'true');
+  vm.run('WoWWhatsApp.Minimize(false)');
+  assert.equal(vm.evaluate('WoWWhatsAppFrame.shown'), 'true');
+  assert.equal(vm.evaluate('WoWWhatsAppMini.shown'), 'false');
+  vm.run('WoWWhatsApp.Toggle(false)');
+  assert.equal(vm.evaluate('WoWWhatsAppFrame.shown'), 'false');
+  assert.equal(vm.evaluate('WoWWhatsAppMini.shown'), 'false');
+  assert.equal(vm.evaluate('WoWWhatsAppDB.settings.shown'), 'false');
 });
 
 test('reload mode writes the outbox for the bridge instead of drawing the strip', () => {
   const vm = newVM();
   login(vm);
-  vm.run('SlashCmdList.WOWCLAUDE("mode reload")');
-  vm.run('SlashCmdList.WOWCLAUDE("reset")');
-  vm.run('WoWClaude.Send("via reload")');
+  vm.run('SlashCmdList.WOWWHATSAPP("mode reload")');
+  vm.run('SlashCmdList.WOWWHATSAPP("reset")');
+  vm.run('WoWWhatsApp.Send("via reload")');
   assert.equal(vm.evaluate('STUB.reloaded'), 'true');
-  assert.equal(vm.evaluate('WoWClaudeDB.outbox.newSession'), 'true');
-  assert.equal(vm.evaluate('WoWClaudeDB.outbox.text'), Buffer.from('via reload').toString('hex'));
+  assert.equal(vm.evaluate('WoWWhatsAppDB.outbox.newSession'), 'true');
+  assert.equal(vm.evaluate('WoWWhatsAppDB.outbox.text'), Buffer.from('via reload').toString('hex'));
   assert.equal(decodeStrip(vm), null);
 });

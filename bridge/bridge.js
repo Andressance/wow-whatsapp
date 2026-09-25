@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 'use strict';
-// WoW Claude bridge: the half of WoWClaude that lives outside the game.
+// WoW WhatsApp bridge: the half of WoWWhatsApp that lives outside the game.
 //
 //   OUT  capture.ps1 screen-captures the addon's pixel strip -> one or more
 //        {session, chat, id, cwd, flags, text} records per frame
 //        (fallback: the game's SavedVariables file, written on /reload)
-//   RUN  `claude -p` headless in the chat's folder, streaming progress.
-//        Each chat is its own Claude session; up to maxParallel run at once.
+//   RUN  `whatsapp -p` headless in the chat's folder, streaming progress.
+//        Each chat is its own WhatsApp session; up to maxParallel run at once.
 //   IN   we write the latest reply/status of every chat into every
-//        WoWClaude_S### slot addon (the game loads a fresh one from a timer),
+//        WoWWhatsApp_S### slot addon (the game loads a fresh one from a timer),
 //        flip a signal .wav per message, and also write Inbox.lua for the
 //        reload path.
 //
@@ -17,9 +17,9 @@
 //   --inject "text"   pretend the strip said this and exit when done
 //   --project <dir>   default folder for chats that haven't picked one
 //
-// Like `claude` itself, the bridge works in the folder it was started from:
-// `cd my-project && wow-claude` makes my-project the default for every chat
-// that hasn't chosen its own with /wow-claude cd. Started from inside this repo (npm
+// Like `whatsapp` itself, the bridge works in the folder it was started from:
+// `cd my-project && wow-whatsapp` makes my-project the default for every chat
+// that hasn't chosen its own with /wow-whatsapp cd. Started from inside this repo (npm
 // start), it falls back to defaultCwd in config.json.
 
 const fs = require('fs');
@@ -28,6 +28,7 @@ const path = require('path');
 const readline = require('readline');
 const { spawn } = require('child_process');
 const P = require('./protocol'); // the pure protocol code, unit-tested in tests/bridge_test.js
+const WhatsAppProvider = require('./whatsapp');
 
 const HERE = __dirname;
 const CONFIG_FILE = path.join(HERE, 'config.json');
@@ -36,15 +37,15 @@ const LOG_FILE = path.join(HERE, 'bridge.log');
 
 const argv = process.argv.slice(2);
 if (argv.includes('--help') || argv.includes('-h')) {
-  console.log('wow-claude [--project <dir>] [--once] [--inject "text"]\n\n' +
-    'Runs the WoW Claude bridge. Chats without a folder of their own work in <dir>,\n' +
+  console.log('wow-whatsapp [--project <dir>] [--once] [--inject "text"]\n\n' +
+    'Runs the WoW WhatsApp bridge. Chats without a folder of their own work in <dir>,\n' +
     'or in the folder you started it from, or in defaultCwd from bridge/config.json.');
   process.exit(0);
 }
 let cfg;
 try { cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); }
 catch (e) {
-  console.error(`Cannot read ${CONFIG_FILE} (${e.message}).\nRun "node setup.js" in the wow-claude folder first.`);
+  console.error(`Cannot read ${CONFIG_FILE} (${e.message}).\nRun "node setup.js" in the wow-whatsapp folder first.`);
   process.exit(2); // the supervisor doesn't restart on 2
 }
 const once = argv.includes('--once');
@@ -62,10 +63,10 @@ function insideRepo(dir) {
 const projectIdx = argv.indexOf('--project');
 const DEFAULT_CWD = path.resolve(
   projectIdx >= 0 && argv[projectIdx + 1] ? argv[projectIdx + 1]
-    : process.env.WOW_CLAUDE_PROJECT ? process.env.WOW_CLAUDE_PROJECT
+    : process.env.WOW_WHATSAPP_PROJECT ? process.env.WOW_WHATSAPP_PROJECT
     : !insideRepo(process.cwd()) ? process.cwd()
     : cfg.defaultCwd || process.cwd());
-const DEFAULT_CWD_SOURCE = projectIdx >= 0 ? '--project' : process.env.WOW_CLAUDE_PROJECT ? 'WOW_CLAUDE_PROJECT'
+const DEFAULT_CWD_SOURCE = projectIdx >= 0 ? '--project' : process.env.WOW_WHATSAPP_PROJECT ? 'WOW_WHATSAPP_PROJECT'
   : !insideRepo(process.cwd()) ? 'started here' : 'config.json';
 
 const resolveCwd = raw => P.resolveCwd(raw, DEFAULT_CWD);
@@ -82,6 +83,9 @@ function siblingFolders() {
 const SLOTS = cfg.slots || 200;
 const MAX_PARALLEL = cfg.maxParallel || 3;
 const cap = Object.assign({ enabled: true, processName: 'WowB', cellPx: 4, cellsPerRow: 200, maxRows: 48, intervalMs: 250 }, cfg.capture || {});
+const whatsappConfig = Object.assign({ enabled: true, authPath: path.join(HERE, '.wwebjs_auth'), headless: true }, cfg.whatsapp || {});
+let whatsapp = null;
+const whatsappPending = new Set();
 
 let state = readJson(STATE_FILE, { lastId: 0, sessions: {}, handled: {} });
 if (!state.handled) state.handled = {};
@@ -117,9 +121,16 @@ function noteMessage(job, role, text) {
   if (role === 'user') forgotten.delete(job.chat);
   else if (forgotten.has(job.chat)) return;
   const c = transcripts.chats[job.chat] = transcripts.chats[job.chat] || { id: job.chat, name: '', cwd: job.cwd, messages: [] };
-  if (job.name) c.name = job.name;
+  if (job.chatName || job.name) c.name = job.chatName || job.name;
   if (job.cwd) c.cwd = job.cwd;
-  c.messages.push({ role, text: String(text ?? '').slice(0, 4000), id: job.id, t: Math.floor(Date.now() / 1000) });
+  c.messages.push({
+    role,
+    text: String(text ?? '').slice(0, 4000),
+    id: job.id,
+    t: Math.floor(Date.now() / 1000),
+    ...(job.sender ? { sender: String(job.sender).slice(0, 120) } : {}),
+    ...(job.replyTo ? { replyTo: String(job.replyTo).slice(0, 120) } : {}),
+  });
   while (c.messages.length > 200) c.messages.shift();
   c.updated = Date.now();
   saveTranscripts();
@@ -143,7 +154,7 @@ function maybeOfferRestore(job) {
 }
 
 // The player deleted a chat in game. Drop everything we keep for it, so the next
-// restore doesn't bring it back and its id can't resume the old Claude session.
+// restore doesn't bring it back and its id can't resume the old WhatsApp session.
 function forgetChat(job) {
   if (!job.chat) return;
   const had = !!transcripts.chats[job.chat];
@@ -193,13 +204,6 @@ function atomicWrite(file, content) {
   fs.renameSync(tmp, file);
 }
 
-function resolveClaude() {
-  if (cfg.claudePath) return cfg.claudePath;
-  const local = path.join(os.homedir(), '.local', 'bin', 'claude.exe');
-  if (fs.existsSync(local)) return local;
-  return 'claude';
-}
-
 // ---------------------------------------------------------------------------
 // What the game reads
 // ---------------------------------------------------------------------------
@@ -210,23 +214,23 @@ function slotFile(globalName, records) {
 }
 
 function addonInstalled() {
-  return fs.existsSync(path.join(cfg.addonDir, 'WoWClaude', 'WoWClaude.toc'));
+  return fs.existsSync(path.join(cfg.addonDir, 'WoWWhatsApp', 'WoWWhatsApp.toc'));
 }
 
 function slotsInstalled() {
-  return fs.existsSync(path.join(cfg.addonDir, 'WoWClaude_S001', 'Inbox.lua'));
+  return fs.existsSync(path.join(cfg.addonDir, 'WoWWhatsApp_S001', 'Inbox.lua'));
 }
 
 // The game will load *some* unused slot next, so every slot gets the full picture.
 // A missing addon folder (not installed yet, or the game folder moved) must not
-// take the bridge down: capture and Claude runs keep working, and the game just
+// take the bridge down: capture and WhatsApp runs keep working, and the game just
 // won't see replies until `node setup.js` has run and WoW was restarted.
 let warnedNoAddon = false;
 function publishNow() {
   lastPublish = Date.now();
-  const records = [...live.values()].slice(-30);
+  const records = [...live.values()].slice(-100);
   try {
-    atomicWrite(cfg.inboxFile, slotFile('WoWClaude_Inbox', records));
+    atomicWrite(cfg.inboxFile, slotFile('WoWWhatsApp_Inbox', records));
   } catch (e) {
     if (!warnedNoAddon) {
       warnedNoAddon = true;
@@ -235,9 +239,9 @@ function publishNow() {
     return;
   }
   if (!slotsInstalled()) return;
-  const body = slotFile('WoWClaude_SlotData', records);
+  const body = slotFile('WoWWhatsApp_SlotData', records);
   for (let i = 1; i <= SLOTS; i++) {
-    try { atomicWrite(path.join(cfg.addonDir, 'WoWClaude_S' + pad3(i), 'Inbox.lua'), body); } catch {}
+    try { atomicWrite(path.join(cfg.addonDir, 'WoWWhatsApp_S' + pad3(i), 'Inbox.lua'), body); } catch {}
   }
   // The restore bundle is large; it rides along once and is then dropped.
   // (The game keeps loading fresh slots until it has read one carrying it.)
@@ -245,7 +249,7 @@ function publishNow() {
 }
 
 // Final results publish immediately; progress is throttled. `key` is the chat
-// (record.session is Claude's session id, a different thing).
+// (record.session is WhatsApp's session id, a different thing).
 function publish(key, record, urgent) {
   live.set(key, record);
   if (urgent) { if (publishTimer) { clearTimeout(publishTimer); publishTimer = null; } publishNow(); return; }
@@ -255,7 +259,7 @@ function publish(key, record, urgent) {
 }
 
 function signal(kind, id, on) {
-  const file = path.join(cfg.addonDir, 'WoWClaude', kind, pad3(slotNumber(id)) + '.wav');
+  const file = path.join(cfg.addonDir, 'WoWWhatsApp', kind, pad3(slotNumber(id)) + '.wav');
   try { atomicWrite(file, on ? SILENT_WAV : Buffer.alloc(0)); } catch {}
 }
 
@@ -264,7 +268,7 @@ function signal(kind, id, on) {
 // without spending a reply slot.
 const ACT_MAX = cfg.actMax || 60;
 function actFile(id, k) {
-  return path.join(cfg.addonDir, 'WoWClaude', 'act', pad3(slotNumber(id)), String(k).padStart(2, '0') + '.wav');
+  return path.join(cfg.addonDir, 'WoWWhatsApp', 'act', pad3(slotNumber(id)), String(k).padStart(2, '0') + '.wav');
 }
 function resetBeats(id) {
   for (let k = 1; k <= ACT_MAX; k++) { try { atomicWrite(actFile(id, k), Buffer.alloc(0)); } catch {} }
@@ -280,17 +284,31 @@ function beat(job) {
 // restarts so a filename is never reused while the game is still running; the
 // files just ahead of the counter are kept empty so the game can't run ahead.
 const PRESENCE_MAX = cfg.presenceMax || 2000;
+const INCOMING_MAX = cfg.incomingMax || 2000;
 function presenceFile(k) {
-  return path.join(cfg.addonDir, 'WoWClaude', 'presence', String(k).padStart(4, '0') + '.wav');
+  return path.join(cfg.addonDir, 'WoWWhatsApp', 'presence', String(k).padStart(4, '0') + '.wav');
 }
 function presenceBeat() {
-  if (!fs.existsSync(path.join(cfg.addonDir, 'WoWClaude', 'presence'))) return;
+  if (!fs.existsSync(path.join(cfg.addonDir, 'WoWWhatsApp', 'presence'))) return;
   state.presence = ((state.presence || 0) % PRESENCE_MAX) + 1;
   const k = state.presence;
   try { atomicWrite(presenceFile(k), SILENT_WAV); } catch {}
   for (let j = 1; j <= 50; j++) {
     const n = ((k - 1 + j) % PRESENCE_MAX) + 1;
     try { atomicWrite(presenceFile(n), Buffer.alloc(0)); } catch {}
+  }
+
+  saveState();
+}
+
+function incomingBeat() {
+  if (!fs.existsSync(path.join(cfg.addonDir, 'WoWWhatsApp', 'incoming'))) return;
+  state.incoming = ((state.incoming || 0) % INCOMING_MAX) + 1;
+  const k = state.incoming;
+  try { atomicWrite(path.join(cfg.addonDir, 'WoWWhatsApp', 'incoming', String(k).padStart(4, '0') + '.wav'), SILENT_WAV); } catch {}
+  for (let j = 1; j <= 50; j++) {
+    const n = ((k - 1 + j) % INCOMING_MAX) + 1;
+    try { atomicWrite(path.join(cfg.addonDir, 'WoWWhatsApp', 'incoming', String(n).padStart(4, '0') + '.wav'), Buffer.alloc(0)); } catch {}
   }
   saveState();
 }
@@ -309,7 +327,7 @@ function readOutbox() {
 // The addon sends the player's in-game context (character, location, ...) with
 // its hello and again whenever it changes; an empty one means "context off".
 // It is kept in state.json so a restarted bridge still has it, and goes into
-// Claude's system prompt on every run (see protocol.systemPrompt).
+// WhatsApp's system prompt on every run (see protocol.systemPrompt).
 function setContext(job) {
   const text = String(job.ctx || '').replace(/\r/g, '').trim().slice(0, 2000);
   const prev = (state.context && state.context.text) || '';
@@ -354,23 +372,47 @@ function allowRules(rules) {
 }
 
 // ---------------------------------------------------------------------------
-// Running Claude
+// Running WhatsApp
 // ---------------------------------------------------------------------------
+
+function submitWhatsApp(job) {
+  if (!whatsapp) {
+    finish(job, 'error', 'WhatsApp is not initialized.');
+    return;
+  }
+  if (whatsappPending.has(job.id)) return;
+  whatsappPending.add(job.id);
+  const key = chatKey(job);
+  const cwd = job.cwd || '';
+  noteMessage(job, 'user', job.text);
+  whatsapp.send(job.chat, job.text).then(() => {
+    markHandled(job);
+    saveState();
+    signal('ack', job.id, true);
+    publish(key, { chat: job.chat, id: job.id, status: 'sent', text: '', cwd, name: job.name || job.chat }, true);
+    log(`#${job.id}${job.session ? '@' + job.session : ''} sent WhatsApp message to ${job.chat}`);
+  }).catch(error => {
+    finish(job, 'error', error.message);
+  }).finally(() => {
+    whatsappPending.delete(job.id);
+  });
+}
 
 function submit(job) {
   if (alreadyHandled(job)) return;
   if (job.ctx !== undefined) setContext(job);
   if (job.forget) {
-    // A deleted chat: forget it and ack. No Claude run.
+    // A deleted chat: forget it and ack. No WhatsApp run.
     markHandled(job);
     forgetChat(job);
     saveState();
     signal('ack', job.id, true);
     return;
   }
+
   if (job.hello) {
     // The addon announcing itself: ack, offer a restore if its data is fresh,
-    // and refresh the slots so it can read our clock. No Claude run.
+    // and refresh the slots so it can read our clock. No WhatsApp run.
     markHandled(job);
     saveState();
     signal('ack', job.id, true);
@@ -401,126 +443,72 @@ function drainQueue() {
   }
 }
 
+function receiveWhatsApp(message) {
+  if (!message.text.trim()) return;
+  const id = state.lastId + 1;
+  const job = {
+    id,
+    session: '',
+    chat: message.chat,
+    name: message.name,
+    chatName: message.chatName || message.name,
+    isGroup: message.isGroup,
+    cwd: '',
+    text: message.text,
+    sender: message.sender,
+    replyTo: message.replyTo,
+    via: 'whatsapp',
+  };
+  state.lastId = id;
+  noteMessage(job, 'contact', message.text);
+  // Incoming messages need distinct live keys. Using only the chat id would
+  // replace a previous message when several arrive before WoW polls a slot.
+  publish(`${chatKey(job)}:incoming:${id}`, {
+    chat: message.chat,
+    id,
+    status: 'incoming',
+    text: message.text,
+    cwd: '',
+    name: message.name,
+    chatName: message.chatName || message.name,
+    isGroup: message.isGroup,
+    sender: message.sender,
+    replyTo: message.replyTo,
+    timestamp: message.timestamp,
+  }, true);
+  signal('sig', id, true);
+  incomingBeat();
+  log(`WhatsApp message from ${message.name} (${message.chat})`);
+}
+
+function startWhatsApp() {
+  if (!whatsappConfig.enabled) return;
+  whatsapp = new WhatsAppProvider(whatsappConfig, {
+    qr: qr => {
+      log('WhatsApp QR received. Scan it from WhatsApp > Linked devices.');
+      try {
+        require('qrcode-terminal').generate(qr, { small: true });
+      } catch (error) {
+        log('Could not render WhatsApp QR:', error.message);
+      }
+    },
+    ready: () => log('WhatsApp connected and ready'),
+    error: error => log('WhatsApp error:', error.message),
+    disconnected: reason => log('WhatsApp disconnected:', String(reason)),
+    message: receiveWhatsApp,
+  });
+  whatsapp.start().catch(error => {
+    log('WhatsApp startup failed:', error.message);
+    if (!exitWhenIdle) setTimeout(startWhatsApp, 10000);
+  });
+}
+
 function runJob(job) {
-  const key = chatKey(job);
-  const cwd = resolveCwd(job.cwd);
-  job.cwd = cwd;
-  const tag = `#${job.id}${job.session ? '@' + job.session : ''}`;
-  signal('sig', job.id, false);
-  resetBeats(job.id);
-  signal('ack', job.id, true);
-  if (!fs.existsSync(cwd)) {
-    log(`${tag} cwd does not exist: ${cwd}`);
-    const sibs = siblingFolders();
-    finish(job, 'error', `Folder does not exist: ${cwd}\n` +
-      `Paths are relative to ${DEFAULT_CWD}.` +
-      (sibs.length ? `\nFolders there: ${sibs.join(', ')}` : '') +
-      `\nUse /wow-claude cd <folder> to pick one, or /wow-claude cd alone for the default.`);
+  if (!whatsappConfig.enabled) {
+    finish(job, 'error', 'WhatsApp integration is disabled. Enable whatsapp.enabled in bridge/config.json.');
     return;
   }
-  const skey = sessKey(job);
-  if (job.newSession) { delete state.sessions[skey]; delete state.sessions[key]; }
-  // Claude keeps sessions per project folder, so a session can't follow a chat
-  // into another folder: start fresh there.
-  const prevCwd = state.sessionCwd && state.sessionCwd[skey];
-  if (prevCwd && !sameFolder(prevCwd, cwd) && state.sessions[skey]) {
-    log(`${tag} folder changed (${prevCwd} -> ${cwd}): new session`);
-    delete state.sessions[skey]; delete state.sessions[key];
-  }
-  if (Array.isArray(job.allow) && job.allow.length) {
-    const added = allowRules(job.allow);
-    log(`${tag} allowed: ${job.allow.join(', ')}${added.length ? '' : ' (already allowed)'}`);
-  }
-  maybeOfferRestore(job);
-  noteMessage(job, 'user', job.text);
-  const resume = state.sessions[skey] || state.sessions[key];
-
-  const args = ['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', cfg.permissionMode || 'acceptEdits'];
-  if (Array.isArray(cfg.allowedTools) && cfg.allowedTools.length) args.push('--allowedTools', ...cfg.allowedTools);
-  if (cfg.model) args.push('--model', cfg.model);
-  if (resume) args.push('--resume', resume);
-  const sys = P.systemPrompt(gameContext(), primer());
-  if (sys) args.push('--append-system-prompt', sys);
-
-  const env = { ...process.env };
-  delete env.CLAUDECODE;
-
-  log(`${tag} (${job.via}) starting in ${cwd}${resume ? ' (resume ' + resume.slice(0, 8) + ')' : ' (new session)'}${sys ? ' [game context]' : ''}${running.size ? ' [' + (running.size + 1) + ' running]' : ''}`);
-  const child = spawn(resolveClaude(), args, { cwd, env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
-  running.set(key, { job, child });
-  publish(key, { chat: job.chat, id: job.id, status: 'working', text: resume ? 'thinking...' : 'starting a new session...', cwd, session: resume }, true);
-  child.stdin.end(job.text);
-
-  const progress = [];
-  let sessionId = resume || '';
-  let resultText = null;
-  let isError = false;
-  let denied = [];
-  let stderr = '';
-  let buffer = '';
-
-  const pushProgress = (line) => {
-    progress.push(line);
-    while (progress.length > 10) progress.shift();
-    beat(job);
-    publish(key, { chat: job.chat, id: job.id, status: 'working', text: progress.join('\n'), cwd, session: sessionId }, false);
-  };
-  // Long thinking stretches produce no tool events; keep the heartbeat alive anyway.
-  const keepalive = setInterval(() => beat(job), 45000);
-
-  const handleEvent = (ev) => {
-    if (ev.session_id) sessionId = ev.session_id;
-    if (ev.type === 'assistant' && ev.message && Array.isArray(ev.message.content)) {
-      for (const block of ev.message.content) {
-        if (block.type === 'tool_use') pushProgress(describeToolUse(block));
-        else if (block.type === 'text' && block.text && block.text.trim()) {
-          const snippet = block.text.trim().replace(/\s+/g, ' ');
-          pushProgress(snippet.length > 140 ? snippet.slice(0, 140) + '...' : snippet);
-        }
-      }
-    } else if (ev.type === 'result') {
-      isError = !!ev.is_error;
-      resultText = typeof ev.result === 'string' ? ev.result : JSON.stringify(ev.result ?? '', null, 2);
-      if (Array.isArray(ev.permission_denials) && ev.permission_denials.length) {
-        denied = [...new Set(ev.permission_denials.map(ruleFor))];
-        const list = ev.permission_denials.map(d => d.tool_name + (d.tool_input && d.tool_input.command ? ': ' + d.tool_input.command : '')).join('\n  ');
-        resultText += `\n\n[bridge] Claude needed ${ev.permission_denials.length} action(s) that aren't allowed yet:\n  ${list}\nUse the Allow button below to permit them and let it continue.`;
-      }
-    }
-  };
-
-  child.stdout.on('data', (chunk) => {
-    buffer += chunk.toString('utf8');
-    let nl;
-    while ((nl = buffer.indexOf('\n')) >= 0) {
-      const line = buffer.slice(0, nl).trim();
-      buffer = buffer.slice(nl + 1);
-      if (!line) continue;
-      try { handleEvent(JSON.parse(line)); } catch {}
-    }
-  });
-  child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
-
-  const timer = setTimeout(() => {
-    log(`${tag} timed out after ${cfg.timeoutMs} ms, killing`);
-    child.kill();
-  }, cfg.timeoutMs || 1800000);
-
-  child.on('error', (err) => {
-    clearTimeout(timer);
-    clearInterval(keepalive);
-    finish(job, 'error', `Could not start claude: ${err.message}\nSet "claudePath" in config.json.`);
-  });
-
-  child.on('close', (code) => {
-    clearTimeout(timer);
-    clearInterval(keepalive);
-    if (buffer.trim()) { try { handleEvent(JSON.parse(buffer.trim())); } catch {} }
-    if (sessionId) { state.sessions[skey] = sessionId; (state.sessionCwd = state.sessionCwd || {})[skey] = cwd; }
-    if (resultText !== null && !isError) finish(job, 'done', resultText, sessionId, denied);
-    else if (resultText !== null) finish(job, 'error', resultText, sessionId, denied);
-    else finish(job, 'error', `claude exited with code ${code} and no result.\n${stderr.trim().slice(-1500)}`, sessionId);
-  });
+  submitWhatsApp(job);
 }
 
 function finish(job, status, text, session, denied) {
@@ -529,7 +517,7 @@ function finish(job, status, text, session, denied) {
   running.delete(chatKey(job));
   markHandled(job);
   saveState();
-  noteMessage(job, status === 'done' ? 'claude' : 'system', status === 'done' ? text : 'Bridge error: ' + text);
+  noteMessage(job, status === 'done' ? 'whatsapp' : 'system', status === 'done' ? text : 'Bridge error: ' + text);
   publish(chatKey(job), { chat: job.chat, id: job.id, status, text, cwd: job.cwd, session, denied }, true);
   signal('sig', job.id, true);
   log(`#${job.id}${job.session ? '@' + job.session : ''} ${status} (${text.length} chars)`);
@@ -577,19 +565,20 @@ function startCapture() {
 }
 
 function banner() {
-  console.log('WoW Claude bridge');
-  console.log(`  folder   : ${DEFAULT_CWD}  (${DEFAULT_CWD_SOURCE}; chats can override with /wow-claude cd)`);
+  console.log('WoW WhatsApp bridge');
+  console.log(`  folder   : ${DEFAULT_CWD}  (${DEFAULT_CWD_SOURCE}; chats can override with /wow-whatsapp cd)`);
   console.log(`  addons   : ${cfg.addonDir}`);
   console.log(`  addon    : ${addonInstalled() ? 'installed' : 'NOT INSTALLED - run: node setup.js, then restart WoW'}`);
   console.log(`  slots    : ${slotsInstalled() ? SLOTS + ' installed' : 'NOT INSTALLED - run: node setup.js (or node bridge/install-slots.js), then restart WoW'}`);
   console.log(`  capture  : ${cap.enabled ? 'on (' + cap.processName + ', ' + cap.cellsPerRow + 'x' + cap.maxRows + ' cells of ' + cap.cellPx + 'px)' : 'off'}`);
+  console.log(`  whatsapp : ${whatsappConfig.enabled ? 'on (scan the QR code in the bridge output)' : 'off'}`);
   console.log(`  parallel : up to ${MAX_PARALLEL} chats at once`);
   console.log(`  fallback : ${cfg.savedVariablesFile}`);
-  console.log(`  claude   : ${resolveClaude()}`);
+  console.log(`  whatsapp   : ${whatsappConfig.enabled ? 'enabled' : 'disabled'}`);
   console.log(`  mode     : ${cfg.permissionMode}, ${(cfg.allowedTools || []).length} allowed tool rules`);
   console.log(`  sessions : ${Object.keys(state.sessions).length} saved`);
   const ctx = gameContext();
-  console.log(`  context  : ${cfg.gameContext === false ? 'off (gameContext in config.json)' : ctx ? (ctx.split('\n').find(l => /^Character:/i.test(l)) || ctx.split('\n')[0]).slice(0, 100) : 'none yet (the addon sends it with its hello; /wow-claude context in game)'}`);
+  console.log(`  context  : ${cfg.gameContext === false ? 'off (gameContext in config.json)' : ctx ? (ctx.split('\n').find(l => /^Character:/i.test(l)) || ctx.split('\n')[0]).slice(0, 100) : 'none yet (the addon sends it with its hello; /wow-whatsapp context in game)'}`);
   console.log(`  primer   : ${!PRIMER_FILE ? 'off (primerFile in config.json)' : primer() ? path.resolve(REPO, PRIMER_FILE) + ' (' + primer().length + ' chars, with the context)' : 'NOT FOUND: ' + path.resolve(REPO, PRIMER_FILE)}`);
   console.log('Leave this window open while you play. Ctrl+C to stop.\n');
 }
@@ -598,6 +587,7 @@ banner();
 if (inject !== null) {
   submit({ id: state.lastId + 1, session: '', chat: '', text: inject, cwd: '', newSession: false, via: 'inject' });
 } else {
+  startWhatsApp();
   pollSavedVariables();
   if (once) {
     if (running.size === 0) { console.log('nothing pending'); process.exit(0); }

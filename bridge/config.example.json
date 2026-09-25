@@ -1,12 +1,13 @@
 {
   "addonDir": "C:\\Program Files (x86)\\World of Warcraft\\_classic_beta_\\Interface\\AddOns",
-  "savedVariablesFile": "C:\\Program Files (x86)\\World of Warcraft\\_classic_beta_\\WTF\\Account\\YOUR_ACCOUNT\\SavedVariables\\WoWClaude.lua",
-  "inboxFile": "C:\\Program Files (x86)\\World of Warcraft\\_classic_beta_\\Interface\\AddOns\\WoWClaude\\Inbox.lua",
+  "savedVariablesFile": "C:\\Program Files (x86)\\World of Warcraft\\_classic_beta_\\WTF\\Account\\YOUR_ACCOUNT\\SavedVariables\\WoWWhatsApp.lua",
+  "inboxFile": "C:\\Program Files (x86)\\World of Warcraft\\_classic_beta_\\Interface\\AddOns\\WoWWhatsApp\\Inbox.lua",
   "defaultCwd": "C:\\path\\to\\your\\project",
-  "tocInterface": "16001",
+  "tocInterface": "120100",
   "slots": 200,
   "actMax": 60,
   "presenceMax": 2000,
+  "incomingMax": 2000,
   "presenceIntervalMs": 30000,
   "maxParallel": 3,
   "capture": {
@@ -17,7 +18,6 @@
     "maxRows": 48,
     "intervalMs": 250
   },
-  "claudePath": "",
   "model": "",
   "gameContext": true,
   "primerFile": "docs/WOW-ADDON-PRIMER.md",
@@ -37,5 +37,10 @@
   ],
   "pollMs": 750,
   "progressWriteMs": 3000,
-  "timeoutMs": 1800000
+  "timeoutMs": 1800000,
+  "whatsapp": {
+    "enabled": true,
+    "authPath": ".wwebjs_auth",
+    "headless": true
+  }
 }

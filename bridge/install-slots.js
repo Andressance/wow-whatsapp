@@ -12,10 +12,11 @@ const addons = cfg.addonDir;
 const N = cfg.slots || 200;
 const ACT = cfg.actMax || 60;
 const PRESENCE = cfg.presenceMax || 2000;
+const INCOMING = cfg.incomingMax || 2000;
 const iface = cfg.tocInterface || '16001';
 
-if (!fs.existsSync(path.join(addons, 'WoWClaude', 'WoWClaude.toc'))) {
-  console.error('WoWClaude addon not found under ' + addons);
+if (!fs.existsSync(path.join(addons, 'WoWWhatsApp', 'WoWWhatsApp.toc'))) {
+  console.error('WoWWhatsApp addon not found under ' + addons);
   process.exit(1);
 }
 
@@ -28,35 +29,45 @@ function ensure(file, content) {
 }
 
 for (let i = 1; i <= N; i++) {
-  const name = 'WoWClaude_S' + String(i).padStart(3, '0');
+  const name = 'WoWWhatsApp_S' + String(i).padStart(3, '0');
   const dir = path.join(addons, name);
-  ensure(path.join(dir, name + '.toc'), [
+  const toc = [
     '## Interface: ' + iface,
-    '## Title: WoW Claude slot ' + String(i).padStart(3, '0'),
-    '## Notes: Reply slot for WoW Claude. Load-on-demand; leave it enabled.',
+    '## Title: WoW WhatsApp slot ' + String(i).padStart(3, '0'),
+    '## Notes: Reply slot for WoW WhatsApp. Load-on-demand; leave it enabled.',
     '## LoadOnDemand: 1',
-    '## Dependencies: WoWClaude',
+    '## Dependencies: WoWWhatsApp',
     '',
     'Inbox.lua',
     '',
-  ].join('\n'));
-  ensure(path.join(dir, 'Inbox.lua'), 'WoWClaude_SlotData = nil\n');
-  ensure(path.join(addons, 'WoWClaude', 'sig', String(i).padStart(3, '0') + '.wav'), '');
-  ensure(path.join(addons, 'WoWClaude', 'ack', String(i).padStart(3, '0') + '.wav'), '');
-  // Heartbeat files: one per Claude action, flipped valid by the bridge as it works.
+  ].join('\n');
+  const tocFile = path.join(dir, name + '.toc');
+  if (fs.existsSync(tocFile) && fs.readFileSync(tocFile, 'utf8') !== toc) {
+    fs.writeFileSync(tocFile, toc);
+    made++;
+  } else {
+    ensure(tocFile, toc);
+  }
+  ensure(path.join(dir, 'Inbox.lua'), 'WoWWhatsApp_SlotData = nil\n');
+  ensure(path.join(addons, 'WoWWhatsApp', 'sig', String(i).padStart(3, '0') + '.wav'), '');
+  ensure(path.join(addons, 'WoWWhatsApp', 'ack', String(i).padStart(3, '0') + '.wav'), '');
+  // Heartbeat files: one per WhatsApp action, flipped valid by the bridge as it works.
   for (let k = 1; k <= ACT; k++) {
-    ensure(path.join(addons, 'WoWClaude', 'act', String(i).padStart(3, '0'), String(k).padStart(2, '0') + '.wav'), '');
+    ensure(path.join(addons, 'WoWWhatsApp', 'act', String(i).padStart(3, '0'), String(k).padStart(2, '0') + '.wav'), '');
   }
 }
 
 // Presence files: the bridge flips one every 30 s so the game can show "connected".
 for (let k = 1; k <= PRESENCE; k++) {
-  ensure(path.join(addons, 'WoWClaude', 'presence', String(k).padStart(4, '0') + '.wav'), '');
+  ensure(path.join(addons, 'WoWWhatsApp', 'presence', String(k).padStart(4, '0') + '.wav'), '');
+}
+for (let k = 1; k <= INCOMING; k++) {
+  ensure(path.join(addons, 'WoWWhatsApp', 'incoming', String(k).padStart(4, '0') + '.wav'), '');
 }
 
 // Control files for the addon's self-test: one always empty, one always valid.
-ensure(path.join(addons, 'WoWClaude', 'ctl', 'empty.wav'), '');
-ensure(path.join(addons, 'WoWClaude', 'ctl', 'valid.wav'), require('./protocol').SILENT_WAV);
+ensure(path.join(addons, 'WoWWhatsApp', 'ctl', 'empty.wav'), '');
+ensure(path.join(addons, 'WoWWhatsApp', 'ctl', 'valid.wav'), require('./protocol').SILENT_WAV);
 
 console.log(`slots: ${N}  files created: ${made}  already present: ${kept}`);
 if (made > 0) console.log('Now fully quit and relaunch WoW so it sees the new files.');
