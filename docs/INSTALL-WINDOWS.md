@@ -12,7 +12,7 @@
 
 ```powershell
 npm install
-node setup.js --project "C:\path\to\your\project"
+node setup.js
 ```
 
 4. Fully exit and restart WoW.
@@ -24,12 +24,14 @@ npm start
 ```
 
 7. Scan the QR code from WhatsApp > Linked devices.
-8. In WoW run `/wow-whatsapp`.
+8. In WoW run `/wa`.
 
 ## Updating
 
 Pull or copy the new files, run `npm install` if `package.json` changed, then
-run `node setup.js` and restart WoW. A normal code-only update can use `/reload`
+run `node setup.js` and restart WoW. Setup moves an existing config from the
+old `_classic_beta_` client to `_forever_` when Forever is installed, and keeps
+the rest of it. A normal code-only update can use `/reload`
 after the bridge has restarted.
 
 ## Troubleshooting
@@ -40,8 +42,9 @@ after the bridge has restarted.
   `incoming` signal folder exists; the addon falls back to polling.
 - **QR appears again:** do not delete `.wwebjs_auth/`; it contains the local
   WhatsApp Web session.
+- **The bridge says "waiting for Wow window":** the capture only attaches to a game running from the same client folder as `addonDir` in `config.json`. Re-run `node setup.js` if you moved to another client.
 - **No group title:** restart the bridge so it refreshes the group metadata with
   `getChatById(groupId)`.
-- **Slots exhausted:** run `/wow-whatsapp reload`, or fully restart WoW.
+- **Slots exhausted:** run `/wa reload`, or fully restart WoW.
 - **Never commit:** `bridge/config.json`, state, transcripts, logs,
   `.wwebjs_auth/` or `.wwebjs_cache/`.
