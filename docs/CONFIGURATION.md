@@ -12,7 +12,7 @@ The file is local and ignored by Git. Restart the bridge after editing it.
 | Key | Default | Meaning |
 |---|---|---|
 | `whatsapp.enabled` | `true` | Enable the WhatsApp Web provider. |
-| `whatsapp.authPath` | `.wwebjs_auth` | Local QR-authentication session. Never commit this folder. |
+| `whatsapp.authPath` | `.wwebjs_auth` | Local QR-authentication session, relative to the repository folder (not to where the bridge was started). Never commit this folder. |
 | `whatsapp.headless` | `true` | Hide the Chromium WhatsApp Web window. |
 
 The bridge uses `whatsapp-web.js`; no Meta, Green API or other third-party
@@ -23,11 +23,10 @@ devices.
 
 | Key | Meaning |
 |---|---|
-| `addonDir` | WoW `Interface\AddOns` folder. |
+| `addonDir` | WoW `Interface\AddOns` folder, inside the client folder (`_forever_`). |
 | `inboxFile` | Reload fallback, normally `WoWWhatsApp\Inbox.lua`. |
-| `savedVariablesFile` | WoW saved variables file used by the reload fallback. |
-| `defaultCwd` | Legacy working-folder setting retained for transport compatibility. |
-| `capture` | Screen-capture settings for the pixel transport. |
+| `savedVariablesFile` | WoW saved variables file used by the reload fallback. Empty until the game has created the account folder (re-run `node setup.js` after the first login). |
+| `capture` | Screen-capture settings for the pixel transport. `processName` is the game exe without `.exe` (`Wow`); the capture only attaches to a game running from the same client folder as `addonDir`. |
 | `slots` | Number of load-on-demand inbound slot addons. |
 | `incomingMax` | Number of incoming WAV signal positions. |
 | `presenceMax` | Number of bridge-presence signal positions. |
@@ -58,5 +57,12 @@ npm start
 node bridge\install-slots.js
 ```
 
-The installed command is `wow-whatsapp`; `wow-whatsapp` remains as a legacy
-alias. `bridge\start-window.cmd` starts the bridge in a separate window.
+The installed command is `wow-whatsapp` (`npm link`). `bridge\start-window.cmd`
+starts the bridge in a separate window.
+
+To check the bridge without the game, send one message and exit:
+
+```powershell
+$env:WHATSAPP_INJECT_CHAT = "34600112233@c.us"
+node bridge\bridge.js --inject "hello from the bridge"
+```

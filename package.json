@@ -1,19 +1,18 @@
 {
   "name": "wow-whatsapp",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "description": "Chat with WhatsApp contacts and groups from inside World of Warcraft: Forever, with no UI reloads.",
   "license": "MIT",
   "author": "chelinho139",
   "repository": {
     "type": "git",
-    "url": "https://github.com/chelinho139/wow-whatsapp"
+    "url": "https://github.com/Andressance/wow-whatsapp"
   },
   "keywords": [
     "world-of-warcraft",
     "wow-addon",
     "whatsapp",
-    "world-of-warcraft",
     "bridge"
   ],
   "engines": {
@@ -26,8 +25,7 @@
     "setup": "node setup.js",
     "start": "node bridge/supervisor.js",
     "slots": "node bridge/install-slots.js",
-    "test": "node tests/order_check.js && node --test tests/bridge_test.js tests/restore_test.js tests/addon_test.js && node tests/codec_test.js",
-    "test:live": "node tests/inject_test.js"
+    "test": "node tests/order_check.js && node --test tests/bridge_test.js tests/restore_test.js tests/addon_test.js && node tests/codec_test.js && node tests/inject_test.js"
   },
   "dependencies": {
     "qrcode-terminal": "^0.12.0",

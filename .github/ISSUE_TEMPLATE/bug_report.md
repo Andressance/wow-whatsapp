@@ -20,12 +20,12 @@ assignees: ''
 - WoW client build (login screen, e.g. `1.60.1.69913`):
 - Display mode (windowed / borderless / exclusive fullscreen):
 - Node.js version (`node -v`):
-- WhatsApp version (`whatsapp --version`):
+- whatsapp-web.js version (`npm ls whatsapp-web.js`):
 - wow-whatsapp version or commit:
 
 **Diagnostics**
 
-Output of `/wow-whatsapp diag` in game:
+Output of `/wa diag` in game:
 
 ```
 ```

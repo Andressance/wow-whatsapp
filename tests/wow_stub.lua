@@ -8,7 +8,7 @@
 STUB = {
 	frames = {}, texts = {}, timers = {}, tickers = {}, prints = {}, bindings = {},
 	now = 1000, epoch = 1700000000, sounds = {}, loaded = {}, reloaded = false,
-	tooltips = {}, zone = "Duskwood", subzone = "Darkshire", level = 23, money = 12345,
+	zone = "Duskwood",
 }
 
 local function noop() end
@@ -62,6 +62,8 @@ function Methods.SetPoint(self, point, rel, relPoint, x, y)
 	self.x, self.y = x or 0, y or 0
 end
 function Methods.GetVerticalScrollRange(self) return 0 end
+function Methods.GetVerticalScroll(self) return self.vscroll or 0 end
+function Methods.SetVerticalScroll(self, v) self.vscroll = v end
 function Methods.CreateTexture(self, name, layer)
 	local t = NewObject("Texture", name, self)
 	table.insert(self.textures, t)
@@ -86,23 +88,6 @@ function Methods.ClearFocus(self) if STUB.focus == self then STUB.focus = nil en
 function Methods.HasFocus(self) return STUB.focus == self end
 function Methods.Insert(self, t) self.text = (self.text or "") .. tostring(t) end
 function Methods.GetEditBox(self) return self.editBox end
--- Tooltip scanning: SetHyperlink fills <name>TextLeft<i> / TextRight<i> from
--- STUB.tooltips[link], a list of strings or { left, right } pairs.
-function Methods.ClearLines(self) self.lines = {} end
-function Methods.NumLines(self) return #(self.lines or {}) end
-function Methods.SetHyperlink(self, link)
-	self.lines = STUB.tooltips[link] or {}
-	for i, l in ipairs(self.lines) do
-		local left, right = l, nil
-		if type(l) == "table" then left, right = l[1], l[2] end
-		local L = NewObject("FontString", self.name .. "TextLeft" .. i, self)
-		L.text = left
-		local R = NewObject("FontString", self.name .. "TextRight" .. i, self)
-		R.text = right
-		R.shown = right ~= nil
-	end
-end
-
 function CreateFrame(kind, name, parent, template)
 	local f = NewObject(kind, name, parent)
 	f.template = template
@@ -152,7 +137,7 @@ function InCombatLockdown() return false end
 function ReloadUI() STUB.reloaded = true end
 function GetTime() return STUB.now end
 function time() return STUB.epoch + math.floor(STUB.now) end
-function date(fmt, t) return "12:00" end
+function date(fmt, t) return os.date(fmt, t) end
 C_Timer = {
 	After = function(delay, fn) table.insert(STUB.timers, { delay = delay, fn = fn }) end,
 	NewTicker = function(delay, fn) table.insert(STUB.tickers, fn); return { Cancel = noop } end,
@@ -180,48 +165,6 @@ function SetItemRef() end
 ChatFrameUtil = { InsertLink = function(text) return false end }
 function ChatEdit_InsertLink(text) return ChatFrameUtil.InsertLink(text) end
 
--- The character, for the game context (WoWWhatsApp.GameContext).
-function GetBuildInfo() return "12.1.0", "120100", "Sep 1 2026", 120100 end
-function UnitName(unit) if unit == "player" then return "Testchar" end end
-function GetRealmName() return "Test Realm" end
-function UnitLevel(unit) return STUB.level end
-function UnitRace(unit) return "Night Elf", "NightElf" end
-function UnitClass(unit) return "Hunter", "HUNTER" end
-function UnitFactionGroup(unit) return "Alliance", "Alliance" end
-function GetGuildInfo(unit) return "Test Guild", "Member", 1 end
-function GetZoneText() return STUB.zone end
-function GetSubZoneText() return STUB.subzone end
-function GetMoney() return STUB.money end
-C_Map = {
-	GetBestMapForUnit = function(unit) return 1431 end,
-	GetPlayerMapPosition = function(mapId, unit) return { x = STUB.posX or 0.452, y = STUB.posY or 0.678 } end,
-	GetMapInfo = function(mapId) return { name = "Duskwood", mapID = mapId } end,
-}
-function UnitXP(unit) return 1234 end
-function UnitXPMax(unit) return 5000 end
-function GetNumTalentTabs() return 3 end
-function GetTalentTabInfo(i)
-	local tabs = { { "Beast Mastery", 10 }, { "Marksmanship", 5 }, { "Survival", 0 } }
-	return tabs[i][1], "Interface\\Icons\\x", tabs[i][2]
-end
-TRADE_SKILLS, SECONDARY_SKILLS = "Professions", "Secondary Skills"
-local SKILLS = {
-	{ "Class Skills", true }, { "Bows", false, 46, 115 },
-	{ "Professions", true }, { "Skinning", false, 75, 75 },
-	{ "Secondary Skills", true }, { "First Aid", false, 40, 75 },
-	{ "Weapon Skills", true }, { "Swords", false, 10, 115 },
-}
-function GetNumSkillLines() return #SKILLS end
-function GetSkillLineInfo(i)
-	local s = SKILLS[i]
-	return s[1], s[2] or nil, false, s[3], 0, 0, s[4]
-end
-ITEM_QUALITY2_DESC = "Uncommon"
-C_Item = {
-	GetItemInfo = function(link)
-		if tostring(link):find("^item:2140") then return "Fine Longsword", link, 2, 19, 14, "Weapon", "One-Handed Swords" end
-	end,
-}
 function print(...)
 	local parts = {}
 	for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end

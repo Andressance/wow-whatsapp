@@ -1,4 +1,4 @@
--- WoWWhatsApp: use WhatsApp chats from inside WoW, without reloading.
+-- WoWWhatsApp: a WhatsApp messenger inside WoW, without reloading.
 --
 -- The WoW sandbox has no network and no file reads at runtime. Two doors remain open:
 --
@@ -11,8 +11,8 @@
 --        Each slot is single-use per session; a /reload frees them all.
 --   Fallback ("reload" mode): SavedVariables + Inbox.lua, a ReloadUI() per step.
 --
--- Chats: each chat is its own WhatsApp session (like a separate terminal) with its own
--- folder, history and pending message. The bridge runs them in parallel.
+-- Chats: each chat is one WhatsApp conversation (a contact or a group) with its own
+-- history. Chats are created by incoming messages, or by /wa new <phone number>.
 -- Everything here is plain addon API. No automation, no memory reading.
 
 local ADDON_NAME = ...
@@ -20,13 +20,11 @@ local WoWWhatsApp = {}
 _G.WoWWhatsApp = WoWWhatsApp
 local Codec = WoWWhatsApp_Codec
 
-local DEFAULT_CWD = "" -- empty = the bridge's configured defaultCwd
 local MAX_HISTORY = 200
-local MAX_CHATS = 16
+local MAX_CHATS = 50
 
 local SLOT_COUNT = 200
 local SLOT_PREFIX = "WoWWhatsApp_S"
-local ACT_MAX = 60 -- heartbeat files per message (act/NNN/01..60.wav)
 local PRESENCE_MAX = 2000 -- presence/0001..2000.wav, one flipped by the bridge every 30 s
 local INCOMING_MAX = 2000 -- incoming/0001..2000.wav, one flipped per WhatsApp message
 local STRIP_TRIES = 3 -- re-show an unacknowledged message this many times before falling back
@@ -52,13 +50,6 @@ local BACKDROP = {
 	edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
 	tile = true, tileSize = 16, edgeSize = 16,
 	insets = { left = 4, right = 4, top = 4, bottom = 4 },
-}
-
-local ROLE_STYLE = {
-	user   = { label = "You",    color = { 0.49, 0.78, 1.00 }, bg = { 0.25, 0.45, 0.75, 0.16 } },
-	contact = { label = "Contact", color = { 0.35, 0.95, 0.55 }, bg = { 0.20, 0.65, 0.35, 0.12 } },
-	whatsapp = { label = "Contact", color = { 0.35, 0.95, 0.55 }, bg = { 0.20, 0.65, 0.35, 0.12 } },
-	system = { label = "System", color = { 0.62, 0.62, 0.62 }, bg = { 0.50, 0.50, 0.50, 0.10 } },
 }
 
 ---------------------------------------------------------------------------
@@ -87,35 +78,6 @@ local function FmtDur(sec)
 	return math.floor(sec / 3600) .. "h" .. string.format("%02d", math.floor(sec / 60) % 60) .. "m"
 end
 
--- Last path component of a folder, for labels.
-local function FolderName(cwd)
-	local name = tostring(cwd or ""):gsub("[\\/]+$", ""):match("([^\\/]+)$")
-	return name or ""
-end
-
--- The folder a chat works in: its own, or the bridge's default (the folder the
--- bridge was started from), which the bridge reports in every slot file.
-local function ChatFolder(c)
-	if c and c.cwd ~= "" then return c.cwd end
-	return run.bridgeCwd or ""
-end
-
--- First few words of a message, as a chat title.
-local function AutoTitle(text)
-	local words = {}
-	for w in tostring(text or ""):gmatch("%S+") do
-		w = w:gsub("^[%p]+", ""):gsub("[%p]+$", "")
-		if w ~= "" then
-			table.insert(words, w)
-			if #words >= 5 then break end
-		end
-	end
-	local title = table.concat(words, " ")
-	if #title > 24 then title = title:sub(1, 24):gsub("%s+%S*$", "") end
-	if title == "" then return nil end
-	return title:sub(1, 1):upper() .. title:sub(2)
-end
-
 local function NewId()
 	return string.format("%x%04x", time() % 0xFFFFFF, math.random(0, 0xFFFF))
 end
@@ -131,7 +93,8 @@ local function ActiveChat()
 end
 
 local function IsWhatsAppId(name)
-	return type(name) == "string" and (name:find("@g.us", 1, true) ~= nil or name:find("@c.us", 1, true) ~= nil)
+	return type(name) == "string" and (name:find("@g.us", 1, true) ~= nil or name:find("@c.us", 1, true) ~= nil
+		or name:find("@lid", 1, true) ~= nil)
 end
 
 local function IsDefaultChatName(name)
@@ -139,13 +102,33 @@ local function IsDefaultChatName(name)
 		or name:match("^Chat %d+$") ~= nil)
 end
 
-local function AddChat(name, cwd, id)
-	if #db.chats >= MAX_CHATS then return nil end
-	local current = ActiveChat()
+-- When did anything last happen in this chat (for sorting the list)?
+local function LastActivity(c)
+	local m = c.history[#c.history]
+	return (m and m.t) or c.created or 0
+end
+
+-- Room for a new chat: when the list is full, the chat that has been quiet the
+-- longest goes (never the one in front, one with a message in flight, or unread).
+local function MakeRoom()
+	if #db.chats < MAX_CHATS then return true end
+	local victim, oldest
+	for i, c in ipairs(db.chats) do
+		if c.id ~= db.activeChat and not c.pendingId and (c.unread or 0) == 0
+			and (not oldest or LastActivity(c) < oldest) then
+			victim, oldest = i, LastActivity(c)
+		end
+	end
+	if not victim then return false end
+	table.remove(db.chats, victim)
+	return true
+end
+
+local function AddChat(name, id)
+	if not MakeRoom() then return nil end
 	local c = {
 		id = id or NewId(),
 		name = name or ("Chat " .. (#db.chats + 1)),
-		cwd = cwd or (current and current.cwd) or DEFAULT_CWD,
 		history = {},
 		unread = 0,
 		created = time(),
@@ -168,13 +151,13 @@ local function InitDB()
 	local s = db.settings
 	if s.autoRefresh == nil then s.autoRefresh = true end
 	if s.signal == nil then s.signal = true end
-	if s.context == nil then s.context = true end -- tell WhatsApp about the character, zone, etc.
-	s.echo = s.echo or "full" -- how much of each reply to print in the game chat
+	s.echo = s.echo or "full" -- how much of each incoming message to print in the game chat
 	s.mode = s.mode or "pixel"
 	s.interval = s.interval or 20
-	s.cwd = s.cwd or DEFAULT_CWD
-	s.width = s.width or 780
-	s.height = s.height or 500
+	s.width = s.width or 820
+	s.height = s.height or 520
+	-- Leftovers of the AI-assistant version of this addon.
+	s.context, s.cwd, db.outbox = nil, nil, nil
 	db.lastSeq = db.lastSeq or 0
 	-- Chats deleted in game that the bridge hasn't confirmed forgetting yet.
 	db.forget = db.forget or {}
@@ -189,7 +172,6 @@ local function InitDB()
 		local c = {
 			id = NewId(),
 			name = "Chat 1",
-			cwd = s.cwd,
 			history = db.history or {},
 			pendingId = db.pendingId,
 			unread = db.unread or 0,
@@ -202,10 +184,20 @@ local function InitDB()
 	end
 	if #db.chats == 0 then AddChat() end
 	if not FindChat(db.activeChat) then db.activeChat = db.chats[1].id end
+	for _, c in ipairs(db.chats) do
+		c.cwd, c.progress = nil, nil
+		for _, m in ipairs(c.history) do
+			m.denied = nil
+			-- Roles from older versions: everything that is not ours or a note is theirs.
+			if m.role == "whatsapp" or m.role == "claude" or m.role == "assistant" then m.role = "contact" end
+		end
+	end
 end
 
-local function AddHistory(chat, role, text, id, denied, sender, replyTo)
-	table.insert(chat.history, { role = role, text = text, id = id, t = time(), denied = denied, sender = sender, replyTo = replyTo })
+-- opts: sender (who wrote it, for groups), replyTo (who was quoted), t (when).
+local function AddHistory(chat, role, text, id, opts)
+	opts = opts or {}
+	table.insert(chat.history, { role = role, text = text, id = id, t = opts.t or time(), sender = opts.sender, replyTo = opts.replyTo })
 	while #chat.history > MAX_HISTORY do
 		table.remove(chat.history, 1)
 	end
@@ -323,19 +315,16 @@ local function ShowStrip(id, payload)
 	run.stripShown = true
 end
 
--- Record: session, chat, id, cwd, flags, name, [context,] text. Several records
--- per frame. The context field is only present when the flags carry "c", so the
--- bridge can tell it from a separator inside the text.
+-- Record: session, chat, id, (unused), flags, name, text. Several records per
+-- frame. A record separator inside any field would split the record, so they
+-- are replaced by spaces everywhere (the text is the last field, but the
+-- separators between records are still \30).
+local function Wire(s)
+	return (tostring(s or ""):gsub("[\30\31]", " "))
+end
+
 local function RecordFor(id, rec)
-	local name = (rec.name or ""):gsub("[\30\31]", " ")
-	local flags = rec.flags or ""
-	local fields = { db.session, rec.chat, tostring(id), rec.cwd, flags, name }
-	if rec.ctx ~= nil then
-		fields[5] = flags == "" and "c" or (flags .. ";c")
-		table.insert(fields, (rec.ctx:gsub("[\30\31]", " ")))
-	end
-	table.insert(fields, rec.text)
-	return table.concat(fields, US)
+	return table.concat({ db.session, Wire(rec.chat), tostring(id), "", rec.flags or "", Wire(rec.name), Wire(rec.text) }, US)
 end
 
 -- Redraw the strip from every outbound message the bridge hasn't acknowledged.
@@ -391,35 +380,6 @@ local function CheckSignal(kind, id)
 	return SoundValid(string.format("Interface\\AddOns\\WoWWhatsApp\\%s\\%03d.wav", kind, SlotNumber(id)))
 end
 
--- Heartbeat: the bridge flips act/NNN/kk.wav for the k-th action of message NNN.
-local function ActPath(id, k)
-	return string.format("Interface\\AddOns\\WoWWhatsApp\\act\\%03d\\%02d.wav", SlotNumber(id), k)
-end
-
-local function StartActivity(chat, id)
-	local a = { next = 1, count = 0, startedAt = GetTime() }
-	-- The bridge can't have written anything yet, so a valid first file means the
-	-- client cached this slot number's files from an earlier use: don't trust them.
-	if SoundValid(ActPath(id, 1)) then a.unreliable = true end
-	run.act = run.act or {}
-	run.act[chat.id] = a
-end
-
--- Returns true if the counter moved.
-local function PollActivity(chat)
-	local a = run.act and run.act[chat.id]
-	if not a or a.unreliable or not chat.pendingId then return false end
-	local moved = false
-	for _ = 1, 3 do
-		if a.next > ACT_MAX then break end
-		if not SoundValid(ActPath(chat.pendingId, a.next)) then break end
-		a.count = a.count + 1
-		a.next = a.next + 1
-		a.last = GetTime()
-		moved = true
-	end
-	return moved
-end
 
 -- Bridge presence. Evidence the bridge is alive comes from several places:
 -- presence beats, acks, slot data (which carries the bridge's clock), replies.
@@ -578,7 +538,7 @@ function WoWWhatsApp.CheckConnection()
 			local c = queued and ActiveChat()
 			if c and c.id == queued.chat and not c.pendingId then
 				if ui.input and Trim(ui.input:GetText() or "") == queued.text then ui.input:SetText("") end
-				WoWWhatsApp.Send(queued.text, queued.allow)
+				WoWWhatsApp.Send(queued.text)
 			end
 		elseif GetTime() - run.connectingAt > CONNECT_WAIT then
 			run.connectingAt, run.connectFailed = nil, true
@@ -630,24 +590,6 @@ local function SelfTestSignals()
 	end
 end
 
-local function ActivityLine(chat)
-	local a = run.act and run.act[chat.id]
-	local now = GetTime()
-	local started = (a and a.startedAt) or run.sentAt or now
-	local s = "running " .. FmtDur(now - started)
-	if a and not a.unreliable then
-		s = s .. " - " .. a.count .. (a.count == 1 and " action" or " actions")
-		if a.last then
-			local quiet = now - a.last
-			s = s .. ", last " .. FmtDur(quiet) .. " ago"
-			if quiet > 120 then s = s .. " (quiet for a while - stuck? /wow-whatsapp cancel)" end
-		elseif now - started > 60 then
-			s = s .. ", no activity seen yet"
-		end
-	end
-	return s
-end
-
 local function FreeSlot()
 	for i = 1, SLOT_COUNT do
 		local name = SlotName(i)
@@ -666,14 +608,50 @@ local function ScheduleNextPoll()
 	run.nextPollAt = (run.sentAt or GetTime()) + t
 end
 
-local Finish -- defined below
-local NotifyWhatsApp -- defined in the chat notification section
+local Transmit -- defined in the sending section
+local NotifyIncoming -- defined in the notification section
 
--- The bridge has read this record: whatever game context rode on it is now
--- what the bridge knows, so later messages only carry it again if it changes.
+---------------------------------------------------------------------------
+-- What the bridge tells us
+---------------------------------------------------------------------------
+
+-- The message with this id went to WhatsApp (the bridge acked it, or said "sent").
+-- The chat is free again: whatever was typed meanwhile goes out next.
+local function NextQueued(chat)
+	for _, m in ipairs(chat.history) do
+		if m.queued then
+			m.queued = nil
+			Transmit(chat, m)
+			return
+		end
+	end
+end
+
+local function Delivered(chat, id)
+	if not chat or not chat.pendingId or chat.pendingId ~= id then return end
+	for i = #chat.history, 1, -1 do
+		local m = chat.history[i]
+		if m.role == "user" and m.id == id then m.sent, m.failed = true, nil break end
+	end
+	chat.pendingId = nil
+	NextQueued(chat)
+	WoWWhatsApp.Render()
+end
+
+local function Failed(chat, id, why)
+	if not chat or not chat.pendingId or chat.pendingId ~= id then return end
+	for i = #chat.history, 1, -1 do
+		local m = chat.history[i]
+		if m.role == "user" and m.id == id then m.failed = true break end
+	end
+	chat.pendingId = nil
+	AddHistory(chat, "system", "Not sent: " .. tostring(why or "unknown error"))
+	NextQueued(chat)
+	WoWWhatsApp.Render()
+end
+
 local function NoteAcked(rec)
 	rec.acked = true
-	if rec.ctx ~= nil then run.contextSent = rec.ctx end
 end
 
 local function MarkAcked(id)
@@ -685,52 +663,63 @@ local function MarkAcked(id)
 	NotedBridge()
 end
 
--- Dispatch a list of reply records to the chats waiting for them.
+-- Has this exact message been stored already? (A slot can carry it again.)
+local function HasMessage(chat, r)
+	for i = #chat.history, 1, -1 do
+		local m = chat.history[i]
+		if m.text == r.text and (m.ext == r.id or (m.role == "contact" and m.id == r.id)) then return true end
+	end
+	return false
+end
+
+-- A message from WhatsApp: someone wrote to us, or we wrote from the phone (fromMe).
+local function ApplyIncoming(r)
+	local c = FindChat(r.chat)
+	if not c then
+		c = AddChat(r.chatName or r.name or r.chat, r.chat)
+		if not c then return false end
+		c.remoteName = r.chatName or r.name or r.chat
+	end
+	local remoteName = r.chatName or r.name
+	if remoteName and remoteName ~= "" and not c.customName
+		and (not c.name or c.name == c.remoteName or IsWhatsAppId(c.name) or IsDefaultChatName(c.name)) then
+		c.name = remoteName
+		c.remoteName = remoteName
+	end
+	if r.isGroup ~= nil then c.isGroup = r.isGroup end
+	if HasMessage(c, r) then return true end
+	local t = tonumber(r.timestamp)
+	if t and t <= 0 then t = nil end
+	if r.fromMe then
+		AddHistory(c, "user", r.text, nil, { t = t, replyTo = r.replyTo })
+		local m = c.history[#c.history]
+		m.ext, m.sent = r.id, true
+		return true
+	end
+	AddHistory(c, "contact", r.text, r.id, { t = t, sender = r.sender, replyTo = r.replyTo })
+	c.history[#c.history].ext = r.id
+	if db.activeChat ~= c.id or not (ui.frame and ui.frame:IsShown()) then c.unread = (c.unread or 0) + 1 end
+	NotifyIncoming(c, r.text, c.isGroup and r.sender or nil)
+	return true
+end
+
+-- Dispatch a list of records from the bridge. Returns whether any of them was news.
 local function ApplyReplies(replies)
 	local matched = false
 	for _, r in ipairs(replies or {}) do
-		local c = FindChat(r.chat)
 		if r.status == "incoming" and r.chat and r.text then
-			if not c then
-				c = AddChat(r.chatName or r.name or r.chat, "", r.chat)
-				if c then c.remoteName = r.chatName or r.name or r.chat end
-			end
-			if c then
-				local remoteName = r.chatName or r.name
-				if remoteName and remoteName ~= "" and not c.customName
-					and (not c.name or c.name == c.remoteName or IsWhatsAppId(c.name)
-						or IsDefaultChatName(c.name)) then
-					c.name = remoteName
-					c.remoteName = remoteName
-				end
-				if r.isGroup ~= nil then c.isGroup = r.isGroup end
-				local duplicate = false
-				for _, message in ipairs(c.history) do
-					if message.id == r.id and message.role == "contact" then duplicate = true break end
-				end
-				if not duplicate then
-					AddHistory(c, "contact", r.text, r.id, nil, r.sender, r.replyTo)
-					if db.activeChat ~= c.id then c.unread = (c.unread or 0) + 1 end
-					NotifyWhatsApp(c, r.text, c.isGroup and r.sender or nil)
-				end
+			if ApplyIncoming(r) then matched = true end
+		else
+			local c = FindChat(r.chat)
+			if c and c.pendingId and r.id == c.pendingId then
 				matched = true
-			end
-		elseif r.status == "sent" and c and c.pendingId and r.id == c.pendingId then
-			matched = true
-			MarkAcked(r.id)
-			c.pendingId = nil
-			c.progress = nil
-			WoWWhatsApp.Render()
-		elseif c and c.pendingId and r.id == c.pendingId then
-			matched = true
-			MarkAcked(r.id)
-			local denied = type(r.denied) == "table" and #r.denied > 0 and r.denied or nil
-			if r.status == "done" then
-				Finish(c, "whatsapp", r.text or "", denied)
-			elseif r.status == "error" then
-				Finish(c, "system", "Bridge error: " .. tostring(r.text), denied)
-			elseif r.status == "working" then
-				c.progress = r.text
+				if r.status == "sent" then
+					MarkAcked(r.id)
+					Delivered(c, r.id)
+				elseif r.status == "error" then
+					MarkAcked(r.id)
+					Failed(c, r.id, r.text)
+				end
 			end
 		end
 	end
@@ -750,13 +739,15 @@ local function ImportRestore(r)
 			local chat = {
 				id = rc.id,
 				name = (rc.name and rc.name ~= "") and rc.name or ("Chat " .. (#db.chats + 1)),
-				cwd = rc.cwd or DEFAULT_CWD,
 				history = {},
 				unread = 0,
 				created = time(),
+				isGroup = tostring(rc.id):find("@g.us", 1, true) ~= nil or nil,
 			}
 			for _, m in ipairs(rc.messages or {}) do
-				table.insert(chat.history, { role = m.role, text = m.text, id = m.id, t = m.t, sender = m.sender, replyTo = m.replyTo })
+				local role = (m.role == "user" or m.role == "system") and m.role or "contact"
+				table.insert(chat.history, { role = role, text = m.text, id = m.id, t = m.t, sender = m.sender ~= "" and m.sender or nil,
+					replyTo = m.replyTo ~= "" and m.replyTo or nil, sent = role == "user" or nil })
 			end
 			-- Keep the chat we're currently using last so it stays where it was.
 			table.insert(db.chats, math.max(1, #db.chats), chat)
@@ -771,7 +762,7 @@ local function ImportRestore(r)
 			end
 		end
 		AddHistory(current, "system", "Restored " .. added .. " chat(s) from the bridge after the game reset the saved data.")
-		WoWWhatsApp.RenderChatList()
+		WoWWhatsApp.Render()
 	end
 end
 
@@ -801,7 +792,6 @@ TryLoadSlot = function(why)
 		-- The bridge's clock and ours are the same machine; translate to GetTime().
 		NotedBridge(GetTime() - (time() - data.now))
 	end
-	if type(data) == "table" and type(data.cwd) == "string" and data.cwd ~= "" then run.bridgeCwd = data.cwd end
 	local matched = ApplyReplies(type(data) == "table" and data.replies or nil)
 	if type(data) == "table" and data.restore then ImportRestore(data.restore) end
 	if why == "signal" and not matched then
@@ -841,6 +831,7 @@ local function Tick()
 		run.restoring = nil
 		WoWWhatsApp.Render()
 	end
+	local delivered = {}
 	for id, rec in pairs(run.outbound) do
 		if not rec.acked and CheckSignal("ack", id) then
 			NoteAcked(rec)
@@ -855,7 +846,9 @@ local function Tick()
 			changed = true
 		end
 		if rec.acked then
-			if rec.forget then db.forget[rec.forget] = nil end
+			-- The bridge acks a message once it has sent it, so that is "delivered".
+			if rec.forget then db.forget[rec.forget] = nil
+			elseif not rec.hello then table.insert(delivered, { rec.chat, id }) end
 			run.outbound[id] = nil
 			changed = true
 		elseif rec.hello and now - rec.sentAt >= 20 then
@@ -880,6 +873,8 @@ local function Tick()
 			end
 		end
 	end
+	-- After the loop: delivering may queue the next message, which adds to run.outbound.
+	for _, d in ipairs(delivered) do Delivered(FindChat(d[1]), d[2]) end
 	if changed then
 		RefreshStrip()
 		WoWWhatsApp.UpdateStatus()
@@ -892,11 +887,6 @@ local function Tick()
 		end
 		return
 	end
-	local moved = false
-	for _, c in ipairs(db.chats) do
-		if c.pendingId and PollActivity(c) then moved = true end
-	end
-	if moved then WoWWhatsApp.Render() end
 	for _, c in ipairs(db.chats) do
 		if c.pendingId and CheckSignal("sig", c.pendingId) then
 			TryLoadSlot("signal")
@@ -912,317 +902,39 @@ end
 local function ProcessInbox()
 	local inbox = WoWWhatsApp_Inbox
 	if type(inbox) ~= "table" then return end
-	if type(inbox.cwd) == "string" and inbox.cwd ~= "" then run.bridgeCwd = inbox.cwd end
 	ApplyReplies(inbox.replies)
 	if inbox.restore then ImportRestore(inbox.restore) end
 end
 
-Finish = function(chat, role, text, denied)
-	AddHistory(chat, role, text, chat.pendingId, denied)
-	chat.pendingId = nil
-	chat.progress = nil
-	if run.act then run.act[chat.id] = nil end
-	NotedBridge()
-	local visible = ui.frame and ui.frame:IsShown() and db.activeChat == chat.id
-	if not visible then
-		chat.unread = (chat.unread or 0) + 1
-	end
-	if not AnyPending() then
-		keyCatcher:Hide()
-	end
-	if visible and ui.input and chat.draft and chat.draft ~= "" then
-		ui.input:SetText(chat.draft)
-		chat.draft = nil
-	end
-	WoWWhatsApp.Render()
-	WoWWhatsApp.Notify(chat, text)
-end
-
 ---------------------------------------------------------------------------
--- Game context and links
+-- Links
 ---------------------------------------------------------------------------
 
--- WhatsApp only sees text, so two things about the game are spelled out for it:
--- who is asking (the character, where they are; sent with the hello and again
--- when it changes, and put into WhatsApp's system prompt by the bridge), and
--- what the player shift-clicked into the message (item, spell and quest links
--- are meaningless markup to WhatsApp; their tooltips are what the player sees).
--- Every game API here is optional: whatever the client lacks is left out.
-
-local CONTEXT_MAX = 700 -- bytes of context per record; the strip has ~3.2 KB for everything
-local LINK_LINES_MAX = 30 -- tooltip lines kept per link
-local LINK_BYTES_MAX = 900 -- bytes kept per link
-
--- Call a game API that may not exist or may throw, and get its returns or nothing.
-local function Try(fn, ...)
-	if type(fn) ~= "function" then return nil end
-	local ok, a, b, c, d, e, f, g = pcall(fn, ...)
-	if ok then return a, b, c, d, e, f, g end
-end
-
-local function Money(copper)
-	copper = tonumber(copper) or 0
-	local g, s, c = math.floor(copper / 10000), math.floor(copper / 100) % 100, copper % 100
-	if g > 0 then return g .. "g " .. s .. "s " .. c .. "c" end
-	if s > 0 then return s .. "s " .. c .. "c" end
-	return c .. "c"
-end
-
--- A few lines about the game and the character, as the bridge will show them to WhatsApp.
-function WoWWhatsApp.GameContext()
-	local lines = {}
-	local version, build, _, toc = Try(GetBuildInfo)
-	toc = tonumber(toc)
-	local game = "World of Warcraft"
-	if toc and ((toc >= 16000 and toc < 20000) or toc >= 120000) then game = "World of Warcraft: Forever" end
-	local client = ""
-	if version then
-		client = " (client " .. tostring(version) .. (build and ("." .. tostring(build)) or "") .. (toc and (", interface " .. toc) or "") .. ")"
-	end
-	table.insert(lines, "Game: " .. game .. client)
-
-	local name = Try(UnitName, "player")
-	if name then
-		local realm = Try(GetRealmName)
-		local level = Try(UnitLevel, "player")
-		local race = Try(UnitRace, "player")
-		local class = Try(UnitClass, "player")
-		local faction = Try(UnitFactionGroup, "player")
-		local guild = Try(GetGuildInfo, "player")
-		local who = "Character: " .. tostring(name) .. (realm and (" on " .. tostring(realm)) or "")
-		local desc = {}
-		if level then table.insert(desc, "level " .. tostring(level)) end
-		if race then table.insert(desc, tostring(race)) end
-		if class then table.insert(desc, tostring(class)) end
-		if #desc > 0 then who = who .. ", " .. table.concat(desc, " ") end
-		if faction then who = who .. " (" .. tostring(faction) .. ")" end
-		if guild then who = who .. ", guild <" .. tostring(guild) .. ">" end
-		table.insert(lines, who)
-	end
-
-	local zone = Try(GetZoneText)
-	local sub = Try(GetSubZoneText)
-	if zone and zone ~= "" then
-		table.insert(lines, "Location: " .. zone .. ((sub and sub ~= "" and sub ~= zone) and (" - " .. sub) or ""))
-	end
-
-	-- Map coordinates, as the minimap shows them (0-100 across the current map;
-	-- addons get no world x/y/z). Modern C_Map first, the vanilla call as fallback.
-	local x, y, mapName
-	local mapId = Try(C_Map and C_Map.GetBestMapForUnit, "player")
-	if type(mapId) == "number" then
-		local pos = Try(C_Map.GetPlayerMapPosition, mapId, "player")
-		if type(pos) == "table" and type(pos.x) == "number" and type(pos.y) == "number" then x, y = pos.x, pos.y end
-		local info = Try(C_Map.GetMapInfo, mapId)
-		if type(info) == "table" and type(info.name) == "string" then mapName = info.name end
-	end
-	if not x then
-		local px, py = Try(GetPlayerMapPosition, "player")
-		if type(px) == "number" and type(py) == "number" then x, y = px, py end
-	end
-	if x and y and (x > 0 or y > 0) then
-		local where = (mapName and mapName ~= zone) and (" on " .. mapName) or ""
-		table.insert(lines, string.format("Position: %.1f, %.1f%s%s", x * 100, y * 100, where, mapId and (" (map " .. mapId .. ")") or ""))
-	end
-
-	local progress = {}
-	local copper = Try(GetMoney)
-	if copper then table.insert(progress, "Money: " .. Money(copper)) end
-	local xp, xpMax = Try(UnitXP, "player"), Try(UnitXPMax, "player")
-	if type(xp) == "number" and type(xpMax) == "number" and xpMax > 0 then
-		table.insert(progress, "XP: " .. xp .. "/" .. xpMax)
-	end
-	if #progress > 0 then table.insert(lines, table.concat(progress, "; ")) end
-
-	-- Classic-style talent tabs: name, icon, points spent.
-	local tabs = Try(GetNumTalentTabs)
-	if type(tabs) == "number" and tabs > 0 then
-		local parts = {}
-		for i = 1, tabs do
-			local tname, _, points = Try(GetTalentTabInfo, i)
-			if type(tname) == "string" and type(points) == "number" then
-				table.insert(parts, tname .. " " .. points)
-			end
-		end
-		if #parts > 0 then table.insert(lines, "Talents: " .. table.concat(parts, " / ")) end
-	end
-
-	-- Skill lines under the Professions and Secondary Skills headers.
-	local n = Try(GetNumSkillLines)
-	if type(n) == "number" then
-		local header, parts = nil, {}
-		local wanted = { [TRADE_SKILLS or "Professions"] = true, [SECONDARY_SKILLS or "Secondary Skills"] = true }
-		for i = 1, n do
-			local sname, isHeader, _, rank, _, _, maxRank = Try(GetSkillLineInfo, i)
-			if type(sname) == "string" then
-				if isHeader then
-					header = sname
-				elseif header and wanted[header] then
-					table.insert(parts, sname .. (rank and (" " .. tostring(rank) .. (maxRank and ("/" .. tostring(maxRank)) or "")) or ""))
-				end
-			end
-		end
-		if #parts > 0 then table.insert(lines, "Professions: " .. table.concat(parts, ", ")) end
-	end
-
-	local s = table.concat(lines, "\n"):gsub("[\30\31]", " ")
-	if #s > CONTEXT_MAX then s = s:sub(1, CONTEXT_MAX) end
-	return s
-end
-
--- The context to put on the next record, or nil when the bridge already has
--- it (or it wouldn't fit next to this message; it goes with a later one).
--- "" when the setting is off, so the bridge drops what it had.
-local function ContextToSend(room)
-	local ctx = db.settings.context and WoWWhatsApp.GameContext() or ""
-	if ctx == (run.contextSent or "") then return nil end
-	if room and #ctx > room then return nil end
-	return ctx
-end
-
--- Read a link's tooltip off a hidden GameTooltip, one line per row.
-local scanTip
-local function TooltipLines(payload)
-	if not scanTip then
-		scanTip = CreateFrame("GameTooltip", "WoWWhatsAppScanTip", UIParent, "GameTooltipTemplate")
-	end
-	scanTip:SetOwner(UIParent, "ANCHOR_NONE")
-	scanTip:ClearLines()
-	local lines = {}
-	if pcall(scanTip.SetHyperlink, scanTip, payload) then
-		for i = 1, math.min(scanTip:NumLines() or 0, LINK_LINES_MAX) do
-			local left = _G["WoWWhatsAppScanTipTextLeft" .. i]
-			local right = _G["WoWWhatsAppScanTipTextRight" .. i]
-			local l = Trim(tostring((left and left:GetText()) or ""))
-			local r = Trim(tostring((right and right:IsShown() and right:GetText()) or ""))
-			if r ~= "" then l = l .. "  " .. r end
-			if l ~= "" then table.insert(lines, l) end
-		end
-	end
-	scanTip:Hide()
-	return lines
-end
-
--- What a link is, in words: "item 2140 (Uncommon)", "spell 1978", "quest 176".
-local function DescribeLink(payload)
-	local kind, id = payload:match("^(%a+):(%d+)")
-	if not kind then return payload:match("^(%a+)") or "link" end
-	local s = kind .. " " .. id
-	if kind == "item" then
-		local _, _, quality = Try((C_Item and C_Item.GetItemInfo) or GetItemInfo, payload)
-		local desc = type(quality) == "number" and _G["ITEM_QUALITY" .. quality .. "_DESC"]
-		if desc then s = s .. " (" .. desc .. ")" end
-	end
-	return s
-end
-
--- Turn the links in a message into text WhatsApp can use: each becomes [Name]
--- in place, and a block at the end lists what the tooltip says about it.
--- Returns the new text and the number of links found.
+-- Shift-clicked items, spells and quests are meaningless markup to anyone outside
+-- the game: each link becomes its plain [Name]. Returns the new text.
 function WoWWhatsApp.ExpandLinks(text)
-	local links, seen = {}, {}
-	local function Take(payload, name)
-		if not seen[payload] then
-			seen[payload] = true
-			table.insert(links, { payload = payload, name = name })
-		end
-		return "[" .. name .. "]"
-	end
 	-- Coloured links first (|cAARRGGBB|H...|h[Name]|h|r), then bare ones.
-	local out = text:gsub("|c%x%x%x%x%x%x%x%x|H([^|]+)|h%[([^%]]*)%]|h|r", Take)
-	out = out:gsub("|H([^|]+)|h%[([^%]]*)%]|h", Take)
-	if #links == 0 then return text, 0 end
-	local blocks = {}
-	for _, l in ipairs(links) do
-		local head = "[" .. l.name .. "] " .. DescribeLink(l.payload)
-		local body = table.concat(TooltipLines(l.payload), "\n  ")
-		local block = body ~= "" and (head .. "\n  " .. body) or head
-		if #block > LINK_BYTES_MAX then block = block:sub(1, LINK_BYTES_MAX) .. "..." end
-		table.insert(blocks, block)
-	end
-	return out .. "\n\n--- Linked from the game ---\n" .. table.concat(blocks, "\n"), #links
+	local out = text:gsub("|c%x%x%x%x%x%x%x%x|H[^|]+|h(%[[^%]]*%])|h|r", "%1")
+	out = out:gsub("|H[^|]+|h(%[[^%]]*%])|h", "%1")
+	return out
 end
 
 ---------------------------------------------------------------------------
 -- Sending
 ---------------------------------------------------------------------------
 
--- allow: optional list of permission rules to grant before this message runs.
-function WoWWhatsApp.Send(text, allow)
-	local c = ActiveChat()
-	if not c then return end
-	text = Trim(text or "")
-	if c.pendingId then
-		-- Typing while waiting: keep the draft, and check for the reply.
-		if text ~= "" then c.draft = text end
-		if db.settings.mode == "pixel" and not (run.slotsExhausted or run.slotsMissing) then
-			TryLoadSlot("manual")
-		else
-			SafeReload()
-		end
-		return
-	end
-	if text == "" then return end
-	if not WoWWhatsApp.IsConnected() then
-		-- Not connected: the message stays in the box and we try to connect;
-		-- CheckConnection sends it the moment the light turns green. If the bridge
-		-- never answers, the text is still in the box for a later try.
-		if ui.input then ui.input:SetText(text) end
-		run.sendOnConnect = { chat = c.id, text = text, allow = allow }
-		if not run.connectingAt then WoWWhatsApp.Connect() end
-		WoWWhatsApp.Toggle(true)
-		return
-	end
-	-- Shift-clicked links become [Name] plus their tooltip, which is what WhatsApp can read.
-	local links
-	text, links = WoWWhatsApp.ExpandLinks(text)
-	local limit = Codec.MAX_PAYLOAD - 300
-	if #text > limit then
-		AddHistory(c, "system", "That message is too long for one send (" .. #text .. " chars, max ~" .. limit .. "). Split it up." .. (links > 0 and " Each linked item adds its tooltip to the message." or ""))
-		WoWWhatsApp.Render()
-		return
-	end
-	-- The game context rides along when the bridge doesn't have this version yet.
-	local ctx = ContextToSend(limit - #text)
-
+-- Put one stored message on its way (pixel strip, or the SavedVariables outbox
+-- for the reload path). The chat is "pending" until the bridge says it is sent.
+Transmit = function(c, m)
 	db.lastSeq = db.lastSeq + 1
 	local id = db.lastSeq
-	local tokens = {}
-	if c.resetNext then table.insert(tokens, "n") end
-	if allow and #allow > 0 then table.insert(tokens, "allow=" .. table.concat(allow, ",")) end
-	local flags = table.concat(tokens, ";")
-	local newSession = c.resetNext and true or nil
-	c.resetNext = nil
-	db.outbox = {
-		id = id,
-		session = db.session,
-		chat = c.id,
-		text = ToHex(text),
-		cwd = ToHex(c.cwd),
-		ctx = ctx and ToHex(ctx) or nil,
-		newSession = newSession,
-		t = time(),
-	}
+	m.id, m.t = id, time()
 	c.pendingId = id
-	c.draft = nil
-	c.progress = nil
-	AddHistory(c, "user", text, id)
-	-- A chat still carrying its default name takes its title from the first message
-	-- you send (system notes like "/wow-whatsapp cd" before it don't count).
-	if c.name:match("^Chat %d+$") then
-		local first = true
-		for _, m in ipairs(c.history) do
-			if m.role == "user" and m.id ~= id then first = false break end
-		end
-		if first then c.name = AutoTitle(text) or c.name end
-	end
-	db.settings.shown = true
-
+	db.outbox = { id = id, session = db.session, chat = ToHex(c.id), text = ToHex(m.text), t = time() }
 	if db.settings.mode == "pixel" then
-		run.outbound[id] = { chat = c.id, cwd = c.cwd, flags = flags, name = c.name, text = text, ctx = ctx, sentAt = GetTime() }
+		run.outbound[id] = { chat = c.id, flags = "", name = c.name, text = m.text, sentAt = GetTime() }
 		run.sentAt = GetTime()
 		run.polls = 0
-		StartActivity(c, id)
 		ScheduleNextPoll()
 		RefreshStrip()
 		WoWWhatsApp.Render()
@@ -1231,10 +943,45 @@ function WoWWhatsApp.Send(text, allow)
 	end
 end
 
+-- c: the chat to send to (default: the one in front).
+function WoWWhatsApp.Send(text, c)
+	c = c or ActiveChat()
+	if not c then return end
+	text = Trim(text or "")
+	if text == "" then return end
+	if not WoWWhatsApp.IsConnected() then
+		-- Not connected: the message stays in the box and we try to connect;
+		-- CheckConnection sends it the moment the light turns green. If the bridge
+		-- never answers, the text is still in the box for a later try.
+		if ui.input then ui.input:SetText(text) end
+		run.sendOnConnect = { chat = c.id, text = text }
+		if not run.connectingAt then WoWWhatsApp.Connect() end
+		WoWWhatsApp.Toggle(true)
+		return
+	end
+	text = WoWWhatsApp.ExpandLinks(text)
+	local limit = Codec.MAX_PAYLOAD - 300
+	if #text > limit then
+		AddHistory(c, "system", "That message is too long for one send (" .. #text .. " chars, max ~" .. limit .. "). Split it up.")
+		WoWWhatsApp.Render()
+		return
+	end
+	AddHistory(c, "user", text, nil)
+	local m = c.history[#c.history]
+	db.settings.shown = true
+	if c.pendingId then
+		-- The previous message is still on its way: this one follows when it is delivered.
+		m.queued = true
+		WoWWhatsApp.Render()
+	else
+		Transmit(c, m)
+	end
+end
+
 -- Forget: a record with no text telling the bridge a chat was deleted, so it drops
--- the transcript (which a later restore would otherwise bring back) and the
--- WhatsApp session. db.forget keeps the id until the bridge acks, so a delete made
--- while the bridge was away is sent again with the next hello.
+-- the transcript (which a later restore would otherwise bring back).
+-- db.forget keeps the id until the bridge acks, so a delete made while the bridge
+-- was away is sent again with the next hello.
 local function SendForget(chatId)
 	if db.settings.mode ~= "pixel" then return end
 	for _, rec in pairs(run.outbound) do
@@ -1242,21 +989,19 @@ local function SendForget(chatId)
 	end
 	local info = db.forget[chatId] or {}
 	db.lastSeq = db.lastSeq + 1
-	run.outbound[db.lastSeq] = { chat = chatId, cwd = info.cwd or "", flags = "d", name = info.name or "", text = "", sentAt = GetTime(), forget = chatId }
+	run.outbound[db.lastSeq] = { chat = chatId, flags = "d", name = info.name or "", text = "", sentAt = GetTime(), forget = chatId }
 	RefreshStrip()
 end
 
 local function ForgetOnBridge(c)
 	if not c or not c.id then return end
-	db.forget[c.id] = { name = c.name, cwd = c.cwd }
+	db.forget[c.id] = { name = c.name }
 	SendForget(c.id)
 end
 
 -- Hello: a record with no text that just announces our session token. The bridge
 -- acks it, offers a restore if our saved data is fresh, and refreshes the slots,
 -- so the status light and any lost chats come back before the first message.
--- The game context always rides on it (empty when turned off), so the bridge's
--- copy is brought in line at every login and Connect.
 function WoWWhatsApp.SayHello()
 	if db.settings.mode ~= "pixel" then return end
 	local now = GetTime()
@@ -1264,8 +1009,7 @@ function WoWWhatsApp.SayHello()
 	run.lastHelloAt = now
 	db.lastSeq = db.lastSeq + 1
 	local c = ActiveChat()
-	local ctx = db.settings.context and WoWWhatsApp.GameContext() or ""
-	run.outbound[db.lastSeq] = { chat = c and c.id or "", cwd = c and c.cwd or "", flags = "h", name = c and c.name or "", text = "", ctx = ctx, sentAt = now, hello = true }
+	run.outbound[db.lastSeq] = { chat = c and c.id or "", flags = "h", name = c and c.name or "", text = "", sentAt = now, hello = true }
 	run.helloPollAt = now + 5
 	-- Deletions the bridge never confirmed ride along with the hello.
 	for id in pairs(db.forget) do SendForget(id) end
@@ -1293,7 +1037,7 @@ function WoWWhatsApp.Resend()
 		end
 	end
 	if not text then return end
-	run.outbound[c.pendingId] = { chat = c.id, cwd = c.cwd, flags = "", name = c.name, text = text, sentAt = GetTime() }
+	run.outbound[c.pendingId] = { chat = c.id, flags = "", name = c.name, text = text, sentAt = GetTime() }
 	run.sentAt = GetTime()
 	run.polls = 0
 	ScheduleNextPoll()
@@ -1307,16 +1051,6 @@ function WoWWhatsApp.SendFromInput()
 	ui.input:SetText("")
 	ui.input:ClearFocus() -- hand the keyboard back to the game after sending
 	WoWWhatsApp.Send(text)
-end
-
--- The Allow button: grant the rules a reply asked for, then tell WhatsApp to carry on.
-function WoWWhatsApp.Allow(chatId, rules)
-	local c = FindChat(chatId)
-	if not c or c.pendingId or not rules or #rules == 0 then return end
-	if db.activeChat ~= c.id then WoWWhatsApp.SwitchChat(c.id) end
-	for _, m in ipairs(c.history) do m.denied = nil end
-	AddHistory(c, "system", "Allowed: " .. table.concat(rules, ", "))
-	WoWWhatsApp.Send("Those actions are allowed now. Continue from where you left off.", rules)
 end
 
 ---------------------------------------------------------------------------
@@ -1337,71 +1071,62 @@ function WoWWhatsApp.SwitchChat(id)
 		ui.input:SetText(c.draft or "")
 		c.draft = nil
 	end
+	run.scrollToEnd = true
 	WoWWhatsApp.Render()
-	WoWWhatsApp.RenderChatList()
 end
 
-function WoWWhatsApp.NewChat(name)
-	local c = AddChat(name and name ~= "" and name or nil)
-	if not c then
+-- "+34 600 11 22 33" -> "34600112233@c.us"; nil when it doesn't look like a phone number.
+local function PhoneId(text)
+	local digits = tostring(text or ""):gsub("[%s%-%.%(%)]", ""):gsub("^%+", ""):gsub("^00", "")
+	if digits:match("^%d+$") and #digits >= 7 and #digits <= 15 then return digits .. "@c.us", digits end
+end
+
+-- Start (or go to) a chat with a phone number written with its country code.
+function WoWWhatsApp.NewChat(number)
+	local id, digits = PhoneId(number)
+	if not id then
 		local a = ActiveChat()
-		AddHistory(a, "system", "Chat limit reached (" .. MAX_CHATS .. "). Delete one first with /wow-whatsapp delete.")
+		AddHistory(a, "system", "To start a chat, give a phone number with its country code: /wa new 34600112233")
 		WoWWhatsApp.Render()
+		WoWWhatsApp.Toggle(true)
 		return
+	end
+	local c = FindChat(id)
+	if not c then
+		c = AddChat(digits, id)
+		if not c then
+			AddHistory(ActiveChat(), "system", "Chat list full and every chat has something unread or pending.")
+			WoWWhatsApp.Render()
+			return
+		end
 	end
 	WoWWhatsApp.SwitchChat(c.id)
 	WoWWhatsApp.Toggle(true)
 end
 
--- Folder this chat's WhatsApp works in. Empty (or "-" / "default") = the bridge's
--- default. Relative paths are resolved by the bridge against that default.
-function WoWWhatsApp.SetFolder(rest, c)
-	c = c or ActiveChat()
-	if not c then return end
-	rest = Trim(rest or "")
-	if rest == "-" or rest == "default" then rest = "" end
-	local base = run.bridgeCwd or "the bridge's default folder"
-	if rest ~= "" then
-		local changed = rest ~= c.cwd
-		c.cwd = rest
-		local absolute = rest:match("^%a:[\\/]") or rest:match("^[\\/~]")
-		local note = absolute and "" or (" (relative to " .. base .. ")")
-		AddHistory(c, "system", "cwd set to " .. rest .. note .. (changed and #c.history > 1 and "; the next message starts a fresh WhatsApp session there" or ""))
-	elseif c.cwd ~= "" then
-		c.cwd = ""
-		AddHistory(c, "system", "cwd reset to the bridge's default: " .. base)
-	else
-		AddHistory(c, "system", "cwd is the bridge's default: " .. base .. " (/wow-whatsapp cd <folder>, or right-click the chat and pick Folder, to change)")
-	end
-	WoWWhatsApp.Render()
-end
-
-StaticPopupDialogs["WOWWHATSAPP_FOLDER"] = {
-	text = "Folder for this chat\n\nRelative to the bridge's folder (%s), ~, or a full path.\nEmpty = the bridge's default. Changing it starts a fresh WhatsApp session.",
+StaticPopupDialogs["WOWWHATSAPP_NEW"] = {
+	text = "New WhatsApp chat\n\nPhone number with country code, digits only.\nExample: 34600112233",
 	button1 = OKAY,
 	button2 = CANCEL,
 	hasEditBox = 1,
-	editBoxWidth = 320,
-	maxLetters = 250,
+	maxLetters = 24,
 	timeout = 0,
 	whileDead = true,
 	hideOnEscape = true,
-	OnShow = function(dialog, data)
+	OnShow = function(dialog)
 		local box = dialog.GetEditBox and dialog:GetEditBox() or dialog.editBox
 		if box then
-			box:SetText(data and data.cwd or "")
-			box:HighlightText()
+			box:SetText("")
 			box:SetFocus()
 		end
 	end,
-	OnAccept = function(dialog, data)
+	OnAccept = function(dialog)
 		local box = dialog.GetEditBox and dialog:GetEditBox() or dialog.editBox
-		local chat = data and FindChat(data.id)
-		if chat and box then WoWWhatsApp.SetFolder(box:GetText(), chat) end
+		WoWWhatsApp.NewChat(box and box:GetText() or "")
 	end,
 	EditBoxOnEnterPressed = function(box)
 		local dialog = box:GetParent()
-		StaticPopupDialogs["WOWWHATSAPP_FOLDER"].OnAccept(dialog, dialog.data)
+		StaticPopupDialogs["WOWWHATSAPP_NEW"].OnAccept(dialog)
 		dialog:Hide()
 	end,
 	EditBoxOnEscapePressed = function(box)
@@ -1409,11 +1134,8 @@ StaticPopupDialogs["WOWWHATSAPP_FOLDER"] = {
 	end,
 }
 
--- Folder dialog for a chat (the active one when no id is given).
-function WoWWhatsApp.FolderPrompt(id)
-	local c = (id and FindChat(id)) or ActiveChat()
-	if not c then return end
-	StaticPopup_Show("WOWWHATSAPP_FOLDER", run.bridgeCwd or "unknown until connected", nil, { id = c.id, cwd = c.cwd })
+function WoWWhatsApp.NewChatPrompt()
+	StaticPopup_Show("WOWWHATSAPP_NEW")
 end
 
 StaticPopupDialogs["WOWWHATSAPP_RENAME"] = {
@@ -1461,34 +1183,32 @@ function WoWWhatsApp.RenamePrompt(id)
 end
 WoWWhatsApp.RenameActive = WoWWhatsApp.RenamePrompt
 
--- Delete a chat (the active one when no id is given). The last chat is cleared
--- and renamed instead of removed, so there is always one to type into. Either
--- way the bridge is told to forget it, so a restore won't bring it back.
+-- Delete a chat. The last one is cleared instead of removed, and either way the
+-- bridge is told to forget it, so a restore won't bring it back.
 function WoWWhatsApp.DeleteChat(id)
 	local c, idx = nil, nil
-	if id then c, idx = FindChat(id) end
-	if not c then c, idx = ActiveChat() end
+	if id then c, idx = FindChat(id) else c, idx = ActiveChat() end
 	if not c then return end
 	ForgetOnBridge(c)
-	if #db.chats == 1 then
+	if #db.chats <= 1 then
 		wipe(c.history)
-		c.pendingId, c.progress, c.unread, c.draft = nil, nil, 0, nil
+		c.pendingId, c.unread, c.draft = nil, 0, nil
 		c.name = "Chat 1"
+		c.customName, c.remoteName, c.isGroup = nil, nil, nil
 		WoWWhatsApp.Render()
-		WoWWhatsApp.RenderChatList()
 		return
 	end
 	table.remove(db.chats, idx)
 	if db.activeChat == c.id then
 		WoWWhatsApp.SwitchChat(db.chats[math.min(idx, #db.chats)].id)
 	else
-		WoWWhatsApp.RenderChatList()
+		WoWWhatsApp.Render()
 	end
 end
 
--- The trash can on a chat row asks first; /wow-whatsapp delete does not.
+-- The trash can asks first; /wa delete does not.
 StaticPopupDialogs["WOWWHATSAPP_DELETE"] = {
-	text = "Delete chat \"%s\"?\n\nIts transcript goes away (the last chat is cleared instead of removed).",
+	text = "Delete chat \"%s\"?\n\nIts history goes away from the game (WhatsApp itself keeps the conversation). The last chat is cleared instead of removed.",
 	button1 = OKAY,
 	button2 = CANCEL,
 	timeout = 0,
@@ -1505,6 +1225,118 @@ function WoWWhatsApp.ConfirmDelete(id)
 	StaticPopup_Show("WOWWHATSAPP_DELETE", Display(c.name), nil, { id = c.id })
 end
 
+function WoWWhatsApp.ClearChat(id)
+	local c = (id and FindChat(id)) or ActiveChat()
+	if not c then return end
+	wipe(c.history)
+	WoWWhatsApp.Render()
+end
+
+---------------------------------------------------------------------------
+-- Look: a flat messenger window (chat list on the left, bubbles on the right)
+---------------------------------------------------------------------------
+
+local COLOR = {
+	frame   = { 0.07, 0.08, 0.10, 0.98 },
+	border  = { 0.20, 0.22, 0.26, 1 },
+	header  = { 0.04, 0.30, 0.26, 1 },
+	panel   = { 0.09, 0.10, 0.12, 1 },
+	area    = { 0.05, 0.06, 0.075, 1 },
+	mine    = { 0.00, 0.36, 0.30, 1 },
+	theirs  = { 0.17, 0.19, 0.22, 1 },
+	pill    = { 0.15, 0.18, 0.21, 0.95 },
+	field   = { 0.13, 0.15, 0.18, 1 },
+	accent  = { 0.15, 0.82, 0.45, 1 },
+	text    = { 0.93, 0.95, 0.96 },
+	dim     = { 0.62, 0.66, 0.70 },
+	warn    = { 0.95, 0.70, 0.30 },
+	bad     = { 0.95, 0.40, 0.40 },
+}
+local AVATAR_COLORS = {
+	{ 0.20, 0.65, 0.45 }, { 0.25, 0.52, 0.85 }, { 0.80, 0.45, 0.25 }, { 0.62, 0.38, 0.80 },
+	{ 0.85, 0.65, 0.20 }, { 0.80, 0.33, 0.45 }, { 0.30, 0.70, 0.75 }, { 0.55, 0.65, 0.30 },
+}
+local FLAT = "Interface\\Buttons\\WHITE8X8"
+local LIST_W, HEADER_H, ROW_H = 230, 44, 54
+local TITLE_H = 30
+
+local function ColorFor(key)
+	key = tostring(key or "")
+	local h = 0
+	for i = 1, #key do h = (h * 31 + key:byte(i)) % 997 end
+	return AVATAR_COLORS[h % #AVATAR_COLORS + 1]
+end
+
+-- First character (UTF-8 aware), upper-cased when plain ASCII.
+local function Initial(name)
+	local ch = tostring(name or ""):match("^[%w\128-\255]") and tostring(name):match("^[%z\1-\127\194-\244][\128-\191]*") or "#"
+	return ch:upper()
+end
+
+local function Paint(tex, c, alpha)
+	tex:SetColorTexture(c[1], c[2], c[3], alpha or c[4] or 1)
+end
+
+local function ClockOf(t) return date("%H:%M", t) end
+local function DayKey(t) return date("%Y%m%d", t) end
+local function DayLabel(t)
+	local key, now = DayKey(t), time()
+	if key == DayKey(now) then return "Today" end
+	if key == DayKey(now - 86400) then return "Yesterday" end
+	return date("%d %b %Y", t)
+end
+-- List rows: the time today, otherwise the day.
+local function ShortStamp(t)
+	local key, now = DayKey(t), time()
+	if key == DayKey(now) then return ClockOf(t) end
+	if key == DayKey(now - 86400) then return "Yesterday" end
+	return date("%d/%m", t)
+end
+
+-- A plain rectangular button; SetText/Enable/Disable work like the real thing.
+local function FlatButton(parent, label, width, height, onClick, color)
+	local b = CreateFrame("Button", nil, parent)
+	b:SetSize(width, height)
+	b.base = color or COLOR.field
+	b.bg = b:CreateTexture(nil, "BACKGROUND")
+	b.bg:SetAllPoints()
+	Paint(b.bg, b.base)
+	local hl = b:CreateTexture(nil, "HIGHLIGHT")
+	hl:SetAllPoints()
+	hl:SetColorTexture(1, 1, 1, 0.12)
+	b.label = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	b.label:SetPoint("CENTER", b, "CENTER", 0, 0)
+	b.label:SetText(label)
+	b.SetText = function(self, t) self.label:SetText(t) end
+	b.Enable = function(self) self.disabled = nil; Paint(self.bg, self.base) end
+	b.Disable = function(self) self.disabled = true; Paint(self.bg, self.base, 0.35) end
+	b:SetScript("OnClick", function(self, ...)
+		if not self.disabled and onClick then onClick(self, ...) end
+	end)
+	return b
+end
+
+-- Mouse wheel scrolling for a plain ScrollFrame.
+local function WheelScroll(sf, step)
+	sf:EnableMouseWheel(true)
+	sf:SetScript("OnMouseWheel", function(self, delta)
+		local cur, max = self:GetVerticalScroll() or 0, self:GetVerticalScrollRange() or 0
+		self:SetVerticalScroll(math.max(0, math.min(max, cur - delta * step)))
+	end)
+end
+
+-- Round an avatar when the client can mask textures; square otherwise.
+local function Round(tex, parent)
+	if parent.CreateMaskTexture and tex.AddMaskTexture then
+		local ok, mask = pcall(parent.CreateMaskTexture, parent)
+		if ok and mask then
+			mask:SetTexture("Interface\\CHARACTERFRAME\\TempPortraitAlphaMask", "CLAMPTOBLACKADDITIVE", "CLAMPTOBLACKADDITIVE")
+			mask:SetAllPoints(tex)
+			tex:AddMaskTexture(mask)
+		end
+	end
+end
+
 ---------------------------------------------------------------------------
 -- Rendering
 ---------------------------------------------------------------------------
@@ -1513,37 +1345,31 @@ function WoWWhatsApp.UpdateStatus()
 	if not ui.status then return end
 	local c = ActiveChat()
 	local mode = db.settings.mode
-	local s
+	local s, problem
 	if c and c.pendingId then
 		local id = c.pendingId
 		local elapsed = run.sentAt and (GetTime() - run.sentAt) or 0
 		local rec = run.outbound[id]
 		if mode == "pixel" then
 			if run.slotsMissing then
-				s = "Reply slots not installed (run install-slots.js, restart WoW). Using reload instead: Enter or Refresh"
+				s, problem = "Reply slots not installed (run install-slots.js, restart WoW). Using reload instead: Enter or Reload", true
 			elseif run.slotsExhausted then
-				s = "Slot pool used up this session - next keypress reloads to free it"
+				s, problem = "Slot pool used up this session - next keypress reloads to free it", true
 			elseif run.pixelFailed then
-				s = "Bridge didn't see #" .. id .. " after " .. STRIP_TRIES .. " tries - next keypress switches to the reload path (or /wow-whatsapp reload)"
-			elseif c.progress or (run.act and run.act[c.id] and run.act[c.id].count > 0) then
-				s = "WhatsApp is working on #" .. id .. " - " .. ActivityLine(c)
+				s, problem = "Bridge didn't see #" .. id .. " after " .. STRIP_TRIES .. " tries - next keypress switches to the reload path (or /wa reload)", true
 			elseif rec and not rec.acked then
 				s = "Sending #" .. id .. (rec.tries and rec.tries > 1 and (" (try " .. rec.tries .. "/" .. STRIP_TRIES .. ")") or "") .. "..."
-				local state = WoWWhatsApp.BridgeState()
-				if state == "down" then s = s .. " - bridge not seen lately, is the bridge running?" end
+				if WoWWhatsApp.BridgeState() == "down" then s, problem = s .. " - bridge not seen lately, is the bridge running?", true end
 			else
-				s = "Waiting for #" .. id .. " (checked " .. (run.polls or 0) .. "x)"
-				if elapsed > 45 then
-					s = s .. " - no sign of the bridge. Is the bridge running? /wow-whatsapp resend"
-				end
+				s = "Waiting for WhatsApp to take #" .. id .. " (checked " .. (run.polls or 0) .. "x)"
+				if elapsed > 45 then s, problem = s .. " - no sign of the bridge. Is it running? /wa resend", true end
 			end
 		else
-			s = "Waiting for reply #" .. id .. ". Enter or Refresh checks now"
-			if db.settings.autoRefresh then
-				s = s .. "; auto on next keypress after " .. db.settings.interval .. "s"
-			end
+			s = "Message #" .. id .. " goes out on reload. Enter or Reload checks now"
+			if db.settings.autoRefresh then s = s .. "; auto on next keypress after " .. db.settings.interval .. "s" end
 		end
 	elseif not WoWWhatsApp.IsConnected() then
+		problem = true
 		if run.connectingAt and run.sendOnConnect then
 			s = "Connecting to the bridge... your message goes out as soon as it answers"
 		elseif run.connectingAt then
@@ -1555,170 +1381,214 @@ function WoWWhatsApp.UpdateStatus()
 		else
 			s = "Not connected - start the bridge, then click Connect"
 		end
-	elseif c and c.draft and c.draft ~= "" then
-		s = "Reply arrived. Your draft is back in the box - Enter to send it"
 	elseif run.restoring then
 		s = "Connecting to the bridge..."
+	elseif c and IsWhatsAppId(c.id) then
+		s = c.isGroup and "Group" or (c.id:match("^(%d+)@c%.us$") and ("+" .. c.id:match("^(%d+)@c%.us$")) or "WhatsApp")
 	else
-		s = "Ready"
+		s = "Not linked to a WhatsApp contact - delete it and start a chat with the + button"
 	end
-	ui.status:SetText(s)
 	run.statusText = s
+	ui.status:SetText(s)
+	local tone = problem and COLOR.warn or COLOR.dim
+	ui.status:SetTextColor(tone[1], tone[2], tone[3])
 	WoWWhatsApp.UpdateDot()
 	WoWWhatsApp.UpdateConnect()
-	if ui.title then
-		local t = c and Display(c.name) or "WhatsApp"
-		local folder = FolderName(ChatFolder(c))
-		if folder ~= "" then t = t .. "  |cff888888" .. Display(folder) .. "|r" end
-		ui.title:SetText(t)
+	if ui.title then ui.title:SetText(c and Display(c.name) or "WhatsApp") end
+	if ui.avatar and c then
+		Paint(ui.avatar, ColorFor(c.id))
+		ui.avatarInitial:SetText(Initial(c.name))
 	end
-	local cwdText
-	if c and c.cwd ~= "" then
-		cwdText = Display(c.cwd)
-	elseif run.bridgeCwd then
-		cwdText = Display(run.bridgeCwd) .. " (bridge default)"
-	else
-		cwdText = "(bridge default - start the bridge in a folder, or right-click the chat and pick Folder)"
-	end
-	ui.cwd:SetText("cwd: " .. cwdText .. "   mode: " .. mode)
 	if ui.resend then ui.resend:SetShown(c and c.pendingId ~= nil and mode == "pixel") end
 	if ui.refresh then ui.refresh:SetShown(mode ~= "pixel" or run.slotsExhausted or run.slotsMissing or run.pixelFailed or false) end
 	WoWWhatsApp.UpdateMini()
 end
 
--- One message bubble: accent bar, colored label, timestamp, wrapped body.
-local function GetBubble(i)
-	local b = ui.bubbles[i]
+-- One row of the conversation: a bubble, a date pill or a centred note.
+local function GetItem(i)
+	local b = ui.items[i]
 	if b then return b end
 	b = CreateFrame("Frame", nil, ui.content)
 	b.bg = b:CreateTexture(nil, "BACKGROUND")
 	b.bg:SetAllPoints()
-	b.accent = b:CreateTexture(nil, "BORDER")
-	b.accent:SetPoint("TOPLEFT", b, "TOPLEFT", 0, 0)
-	b.accent:SetPoint("BOTTOMLEFT", b, "BOTTOMLEFT", 0, 0)
-	b.accent:SetWidth(3)
 	b.who = b:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	b.who:SetPoint("TOPLEFT", b, "TOPLEFT", 10, -6)
 	b.who:SetJustifyH("LEFT")
+	b.qbar = b:CreateTexture(nil, "BORDER")
+	b.qbar:SetWidth(2)
+	b.quote = b:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+	b.quote:SetJustifyH("LEFT")
+	b.quote:SetWordWrap(false)
 	b.body = b:CreateFontString(nil, "OVERLAY", "ChatFontNormal")
-	b.body:SetPoint("TOPLEFT", b.who, "BOTTOMLEFT", 0, -4)
 	b.body:SetJustifyH("LEFT")
 	b.body:SetJustifyV("TOP")
 	b.body:SetWordWrap(true)
 	b.body:SetNonSpaceWrap(true)
-	b.reply = b:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-	b.reply:SetPoint("TOPLEFT", b.who, "BOTTOMLEFT", 0, -4)
-	b.reply:SetJustifyH("LEFT")
-	b.reply:SetTextColor(0.65, 0.8, 0.72)
 	b.when = b:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-	b.when:SetPoint("TOPRIGHT", b, "TOPRIGHT", -8, -6)
-	b.allow = CreateFrame("Button", nil, b, "UIPanelButtonTemplate")
-	b.allow:SetHeight(22)
-	b.allow:SetPoint("TOPLEFT", b.body, "BOTTOMLEFT", 0, -6)
-	b.allow:SetScript("OnClick", function(self)
-		WoWWhatsApp.Allow(self.chatId, self.rules)
-	end)
-	b.allow:Hide()
+	b.tick = b:CreateTexture(nil, "OVERLAY")
+	b.tick:SetSize(12, 12)
 	-- FontStrings can't be selected, so a click opens the message in the copy box.
 	b:EnableMouse(true)
 	b:SetScript("OnMouseUp", function(self, button)
 		if button == "LeftButton" and self.text and self.text ~= "" then WoWWhatsApp.ShowCopy(self.text) end
 	end)
-	ui.bubbles[i] = b
+	ui.items[i] = b
 	return b
 end
+
+local TICK = {
+	sent = "Interface\\RAIDFRAME\\ReadyCheck-Ready",
+	pending = "Interface\\RAIDFRAME\\ReadyCheck-Waiting",
+	failed = "Interface\\RAIDFRAME\\ReadyCheck-NotReady",
+}
+
+local PAD_X, PAD_Y = 10, 6
 
 function WoWWhatsApp.Render()
 	local c = ActiveChat()
 	if ui.content and c then
 		local width = ui.scroll:GetWidth()
-		if not width or width < 80 then width = 400 end
+		if not width or width < 120 then width = 460 end
 		ui.content:SetWidth(width)
-		local y, n = 0, 0
-		local function Place(role, text, when, dim, denied, sender, replyTo)
+		local maxInner = math.max(120, math.floor(width * 0.72) - 2 * PAD_X)
+		local y, n, prevKey = 4, 0, nil
+		local function Natural(text)
+			ui.measure:SetText(text)
+			return ui.measure:GetStringWidth() or 0
+		end
+		-- kind: "msg" (m = history entry), "date" or "note" (text only)
+		local function Place(kind, text, m)
 			n = n + 1
-			local b = GetBubble(n)
-			local st = ROLE_STYLE[role] or ROLE_STYLE.system
-			b:SetWidth(width)
-			b.bg:SetColorTexture(st.bg[1], st.bg[2], st.bg[3], st.bg[4])
-			b.accent:SetColorTexture(st.color[1], st.color[2], st.color[3], 0.9)
-			b.who:SetText(sender and sender ~= "" and sender or st.label)
-			b.who:SetTextColor(st.color[1], st.color[2], st.color[3])
-			b.when:SetText(when or "")
-			b.body:SetWidth(width - 18)
-			if replyTo and replyTo ~= "" then
-				b.reply:SetText("Reply to " .. Display(replyTo))
-				b.reply:Show()
-				b.body:ClearAllPoints()
-				b.body:SetPoint("TOPLEFT", b.reply, "BOTTOMLEFT", 0, 2)
-			else
-				b.reply:Hide()
-				b.body:ClearAllPoints()
-				b.body:SetPoint("TOPLEFT", b.who, "BOTTOMLEFT", 0, -4)
+			local b = GetItem(n)
+			b.text = text
+			b.who:Hide(); b.quote:Hide(); b.qbar:Hide(); b.tick:Hide(); b.when:SetText("")
+			b:ClearAllPoints()
+			b.body:ClearAllPoints()
+			b.when:ClearAllPoints()
+			b.tick:ClearAllPoints()
+			if kind == "date" or kind == "note" then
+				local w = math.min(kind == "date" and 200 or maxInner, Natural(text) + 4)
+				b.body:SetWidth(w)
+				b.body:SetJustifyH("CENTER")
+				b.body:SetText(Display(text))
+				local tone = kind == "date" and COLOR.text or COLOR.dim
+				b.body:SetTextColor(tone[1], tone[2], tone[3])
+				local h = b.body:GetStringHeight()
+				if not h or h < 1 then h = 14 end
+				b.body:SetPoint("TOP", b, "TOP", 0, -4)
+				Paint(b.bg, COLOR.pill, kind == "date" and 0.95 or 0.5)
+				b:SetSize(w + 20, h + 8)
+				b:SetPoint("TOP", ui.content, "TOP", 0, -y)
+				b.text = kind == "note" and text or nil
+				b:Show()
+				y = y + b:GetHeight() + 8
+				prevKey = nil
+				return
 			end
+			local mine = m.role == "user"
+			local group = c.isGroup and not mine and m.sender and m.sender ~= ""
+			local quote = m.replyTo and m.replyTo ~= "" and ("Reply to " .. Display(m.replyTo)) or nil
+			-- Size the bubble to its content, up to 72% of the window.
+			local bodyW = math.min(maxInner, Natural(Display(text)) + 4)
+			local inner = math.max(bodyW, 58)
+			if group then
+				b.who:SetText(Display(m.sender))
+				local sc = ColorFor(m.sender)
+				b.who:SetTextColor(sc[1], sc[2], sc[3])
+				inner = math.max(inner, math.min(maxInner, b.who:GetStringWidth() or 0))
+			end
+			if quote then
+				b.quote:SetText(quote)
+				inner = math.max(inner, math.min(maxInner, (b.quote:GetStringWidth() or 0) + 8))
+			end
+			local top = PAD_Y
+			if group then
+				b.who:SetPoint("TOPLEFT", b, "TOPLEFT", PAD_X, -top)
+				b.who:SetWidth(inner)
+				b.who:Show()
+				top = top + 14
+			end
+			if quote then
+				b.qbar:SetPoint("TOPLEFT", b, "TOPLEFT", PAD_X, -top)
+				b.qbar:SetHeight(12)
+				b.qbar:SetColorTexture(COLOR.accent[1], COLOR.accent[2], COLOR.accent[3], 0.9)
+				b.qbar:Show()
+				b.quote:SetPoint("TOPLEFT", b, "TOPLEFT", PAD_X + 6, -top)
+				b.quote:SetWidth(inner - 6)
+				b.quote:Show()
+				top = top + 16
+			end
+			b.body:SetJustifyH("LEFT")
+			b.body:SetPoint("TOPLEFT", b, "TOPLEFT", PAD_X, -top)
+			b.body:SetWidth(bodyW)
 			b.body:SetText(Display(text))
-			if dim then
-				b.body:SetTextColor(0.72, 0.72, 0.72)
-			else
-				b.body:SetTextColor(0.93, 0.93, 0.93)
-			end
+			local failed, pending = m.failed, mine and not m.sent and not m.failed
+			local tone = (m.role == "system") and COLOR.dim or COLOR.text
+			b.body:SetTextColor(tone[1], tone[2], tone[3])
 			local h = b.body:GetStringHeight()
 			if not h or h < 1 then h = 14 end
-			local replyHeight = replyTo and replyTo ~= "" and 14 or 0
-			local extra = 0
-			if denied then
-				local label = "Allow " .. table.concat(denied, ", ") .. " & retry"
-				b.allow:SetText(label)
-				b.allow:SetWidth(math.min(width - 24, math.max(160, b.allow:GetFontString():GetStringWidth() + 30)))
-				b.allow.chatId = c.id
-				b.allow.rules = denied
-				b.allow:Show()
-				extra = 28
-			else
-				b.allow:Hide()
+			b.when:SetText(m.t and ClockOf(m.t) or "")
+			b.when:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -PAD_X - (mine and 15 or 0), 4)
+			if mine then
+				b.tick:SetTexture(failed and TICK.failed or (pending and TICK.pending) or TICK.sent)
+				b.tick:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -PAD_X + 1, 3)
+				b.tick:Show()
 			end
-			b:SetHeight(6 + 12 + 4 + replyHeight + h + 8 + extra)
-			b:ClearAllPoints()
-			b:SetPoint("TOPLEFT", ui.content, "TOPLEFT", 0, -y)
-			b.text = text
+			Paint(b.bg, mine and COLOR.mine or COLOR.theirs)
+			b:SetSize(inner + 2 * PAD_X, top + h + 2 + 12 + PAD_Y)
+			-- Same sender twice in a row sit closer together.
+			local key = (mine and "me" or tostring(m.sender or "them"))
+			if prevKey == key then y = y - 4 end
+			prevKey = key
+			if mine then
+				b:SetPoint("TOPRIGHT", ui.content, "TOPRIGHT", -6, -y)
+			else
+				b:SetPoint("TOPLEFT", ui.content, "TOPLEFT", 6, -y)
+			end
 			b:Show()
 			y = y + b:GetHeight() + 6
 		end
-		local last = #c.history
-		for i, m in ipairs(c.history) do
-			-- The Allow button only makes sense on the newest reply, and only while idle.
-			local denied = (i == last and not c.pendingId and type(m.denied) == "table" and #m.denied > 0) and m.denied or nil
-			Place(m.role, m.text, m.t and date("%H:%M", m.t) or "", false, denied, m.sender, m.replyTo)
-		end
-		if c.pendingId then
-			local p = c.progress
-			local head = "working... " .. ActivityLine(c)
-			if run.statusText and run.statusText ~= "" then head = head .. "\n" .. run.statusText end
-			Place("whatsapp", (p and p ~= "") and (head .. "\n\n" .. p) or head, "", true)
-		elseif #c.history == 0 then
-			if run.restoring then
-				Place("system", "Connecting to the bridge and restoring your chats...", "", true)
-			elseif not WoWWhatsApp.IsConnected() then
-				Place("system", "Not connected to the bridge. Start it (npm start in the wow-whatsapp folder, or wow-whatsapp in your project), then click Connect below.", "", true)
+
+		local lastDay
+		for _, m in ipairs(c.history) do
+			if m.t then
+				local day = DayKey(m.t)
+				if day ~= lastDay then
+					lastDay = day
+					Place("date", DayLabel(m.t))
+				end
+			end
+			if m.role == "system" then
+				Place("note", m.text)
 			else
-				Place("system", "Click the box below and type to start. Shift-click an item, spell or quest to link it into your message. /wow-whatsapp help lists the commands; /ai <text> and /r work from the game chat too.", "", true)
+				Place("msg", m.text, m)
 			end
 		end
-		for i = n + 1, #ui.bubbles do
-			ui.bubbles[i]:Hide()
+		if #c.history == 0 then
+			if run.restoring then
+				Place("note", "Connecting to the bridge and restoring your chats...")
+			elseif not WoWWhatsApp.IsConnected() then
+				Place("note", "Not connected to the bridge. Start it (npm start in the wow-whatsapp folder), then click Connect below.")
+			else
+				Place("note", "No messages yet. Type below to write to this chat. Shift-click an item or spell to link it by name.")
+			end
+		end
+		for i = n + 1, #ui.items do
+			ui.items[i]:Hide()
 		end
 		ui.content:SetHeight(math.max(y, 1))
-		C_Timer.After(0.05, function()
-			if ui.scroll then
-				ui.scroll:SetVerticalScroll(ui.scroll:GetVerticalScrollRange())
-			end
-		end)
+		local atEnd = run.scrollToEnd or (ui.scroll:GetVerticalScroll() or 0) >= (ui.scroll:GetVerticalScrollRange() or 0) - 40
+		run.scrollToEnd = nil
+		if atEnd then
+			C_Timer.After(0.05, function()
+				if ui.scroll then ui.scroll:SetVerticalScroll(ui.scroll:GetVerticalScrollRange() or 0) end
+			end)
+		end
 	end
 	WoWWhatsApp.UpdateStatus()
 	WoWWhatsApp.RenderChatList()
 end
 
--- Copy box (/wow-whatsapp copy): a selectable EditBox with the last reply pre-highlighted for Ctrl+C.
+-- Copy box (/wa copy, or click a message): a selectable EditBox pre-highlighted for Ctrl+C.
 function WoWWhatsApp.ShowCopy(text)
 	if not ui.copy then
 		local cf = CreateFrame("Frame", "WoWWhatsAppCopy", UIParent, "BackdropTemplate")
@@ -1732,8 +1602,8 @@ function WoWWhatsApp.ShowCopy(text)
 		cf:SetScript("OnDragStart", cf.StartMoving)
 		cf:SetScript("OnDragStop", cf.StopMovingOrSizing)
 		cf:SetBackdrop(BACKDROP)
-		cf:SetBackdropColor(0.05, 0.05, 0.07, 0.97)
-		cf:SetBackdropBorderColor(0.6, 0.6, 0.6, 1)
+		cf:SetBackdropColor(COLOR.frame[1], COLOR.frame[2], COLOR.frame[3], 0.98)
+		cf:SetBackdropBorderColor(COLOR.border[1], COLOR.border[2], COLOR.border[3], 1)
 		tinsert(UISpecialFrames, "WoWWhatsAppCopy")
 
 		local t = cf:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -1763,47 +1633,128 @@ function WoWWhatsApp.ShowCopy(text)
 	ui.copyBox:HighlightText()
 end
 
-function WoWWhatsApp.RenderChatList()
-	if not ui.chatButtons then return end
-	for i, btn in ipairs(ui.chatButtons) do
-		local c = db.chats[i]
-		if c then
-			local label = Display(c.name)
-			local folder = FolderName(ChatFolder(c))
-			if folder ~= "" and folder:lower() ~= c.name:lower() then
-				label = label .. " |cff888888" .. Display(folder) .. "|r"
-			end
-			if c.pendingId then
-				label = label .. " |cffffd100...|r"
-			elseif (c.unread or 0) > 0 then
-				label = label .. " |cff55ff55(" .. c.unread .. ")|r"
-			end
-			btn.label:SetText(label)
-			btn.chatId = c.id
-			btn.selected:SetShown(c.id == db.activeChat)
-			btn:Show()
-		else
-			btn:Hide()
+-- The chat list: newest conversation first, filtered by the search box.
+local function SortedChats()
+	local list = {}
+	local filter = ui.filter and ui.filter ~= "" and ui.filter:lower() or nil
+	for i, c in ipairs(db.chats) do
+		if not filter or tostring(c.name):lower():find(filter, 1, true) then
+			table.insert(list, { chat = c, order = i, last = LastActivity(c) })
 		end
 	end
+	table.sort(list, function(a, b)
+		if a.last ~= b.last then return a.last > b.last end
+		return a.order < b.order
+	end)
+	return list
+end
+
+local function GetRow(i)
+	local b = ui.rows[i]
+	if b then return b end
+	b = CreateFrame("Button", nil, ui.listContent)
+	b:SetHeight(ROW_H)
+	b.selected = b:CreateTexture(nil, "BACKGROUND")
+	b.selected:SetAllPoints()
+	Paint(b.selected, { 1, 1, 1, 0.09 })
+	local hl = b:CreateTexture(nil, "HIGHLIGHT")
+	hl:SetAllPoints()
+	hl:SetColorTexture(1, 1, 1, 0.05)
+	b.avatar = b:CreateTexture(nil, "ARTWORK")
+	b.avatar:SetSize(38, 38)
+	b.avatar:SetPoint("LEFT", b, "LEFT", 10, 0)
+	b.avatar:SetColorTexture(0.3, 0.3, 0.3, 1)
+	Round(b.avatar, b)
+	b.initial = b:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+	b.initial:SetPoint("CENTER", b.avatar, "CENTER", 0, 0)
+	b.initial:SetTextColor(1, 1, 1)
+	b.stamp = b:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+	b.stamp:SetPoint("TOPRIGHT", b, "TOPRIGHT", -10, -10)
+	b.name = b:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+	b.name:SetPoint("TOPLEFT", b.avatar, "TOPRIGHT", 10, -2)
+	b.name:SetPoint("RIGHT", b.stamp, "LEFT", -6, 0)
+	b.name:SetJustifyH("LEFT")
+	b.name:SetWordWrap(false)
+	b.badge = b:CreateTexture(nil, "ARTWORK")
+	b.badge:SetSize(20, 16)
+	b.badge:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -10, 9)
+	Paint(b.badge, COLOR.accent)
+	Round(b.badge, b)
+	b.count = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	b.count:SetPoint("CENTER", b.badge, "CENTER", 0, 0)
+	b.count:SetTextColor(0.02, 0.1, 0.05)
+	b.preview = b:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+	b.preview:SetPoint("BOTTOMLEFT", b.avatar, "BOTTOMRIGHT", 10, 2)
+	b.preview:SetPoint("RIGHT", b, "RIGHT", -38, 0)
+	b.preview:SetJustifyH("LEFT")
+	b.preview:SetWordWrap(false)
+	-- Left-click opens the chat; right-click opens its menu (Rename, Clear, Delete).
+	b:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+	b:SetScript("OnClick", function(self, button)
+		if button == "RightButton" then
+			WoWWhatsApp.ShowChatMenu(self.chatId, self)
+		else
+			WoWWhatsApp.SwitchChat(self.chatId)
+		end
+	end)
+	b:SetScript("OnDoubleClick", function(self)
+		WoWWhatsApp.SwitchChat(self.chatId)
+		WoWWhatsApp.RenamePrompt(self.chatId)
+	end)
+	ui.rows[i] = b
+	return b
+end
+
+local function PreviewOf(c)
+	if c.pendingId then return "|cffd0d0d0Sending...|r" end
+	local m = c.history[#c.history]
+	if not m then return "" end
+	local flat = (tostring(m.text or ""):gsub("%s+", " "))
+	local prefix = ""
+	if m.role == "user" then prefix = "You: "
+	elseif c.isGroup and m.sender and m.sender ~= "" then prefix = m.sender .. ": " end
+	return Display(prefix .. flat)
+end
+
+function WoWWhatsApp.RenderChatList()
+	if not ui.rows then return end
+	local list = SortedChats()
+	for i, entry in ipairs(list) do
+		local c = entry.chat
+		local b = GetRow(i)
+		b:ClearAllPoints()
+		b:SetPoint("TOPLEFT", ui.listContent, "TOPLEFT", 0, -(i - 1) * ROW_H)
+		b:SetPoint("TOPRIGHT", ui.listContent, "TOPRIGHT", 0, -(i - 1) * ROW_H)
+		Paint(b.avatar, ColorFor(c.id))
+		b.initial:SetText(Initial(c.name))
+		b.name:SetText(Display(c.name))
+		b.stamp:SetText(#c.history > 0 and entry.last > 0 and ShortStamp(entry.last) or "")
+		b.preview:SetText(PreviewOf(c))
+		local unread = c.unread or 0
+		b.badge:SetShown(unread > 0)
+		b.count:SetText(unread > 0 and (unread > 99 and "99+" or tostring(unread)) or "")
+		b.chatId = c.id
+		b.selected:SetShown(c.id == db.activeChat)
+		b:Show()
+	end
+	for i = #list + 1, #ui.rows do ui.rows[i]:Hide() end
+	ui.listContent:SetHeight(math.max(#list * ROW_H, 1))
 end
 
 function WoWWhatsApp.UpdateMini()
 	if not ui.miniBadge then return end
-	local unread, working = 0, 0
+	local unread, sending = 0, 0
 	for _, c in ipairs(db.chats) do
 		unread = unread + (c.unread or 0)
-		if c.pendingId then working = working + 1 end
+		if c.pendingId then sending = sending + 1 end
 	end
 	local t
-	if working > 0 and unread > 0 then
-		t = "|cff55ff55" .. unread .. " new|r |cffffd100" .. working .. " working|r"
-	elseif working > 0 then
-		t = "|cffffd100" .. (working == 1 and "working..." or (working .. " working...")) .. "|r"
-	elseif unread > 0 then
-		t = "|cff55ff55" .. unread .. (unread == 1 and " new reply" or " new replies") .. "|r"
+	if unread > 0 then
+		t = "|cff25d366" .. unread .. (unread == 1 and " new message" or " new messages") .. "|r"
+	elseif sending > 0 then
+		t = "|cffd0d0d0sending...|r"
 	else
-		t = "|cff999999idle|r"
+		t = "|cff999999no new messages|r"
 	end
 	ui.miniBadge:SetText(t)
 	if ui.miniPulse then
@@ -1816,26 +1767,28 @@ function WoWWhatsApp.UpdateMini()
 	end
 end
 
-local ECHO_DEFAULT = 4000 -- characters of a reply to print into the game chat ("/wow-whatsapp echo <n>")
+---------------------------------------------------------------------------
+-- Notifications and the game chat
+---------------------------------------------------------------------------
 
-local function ChatLinks(chat)
-	return "  |Hwhatsapp:open:" .. chat.id .. "|h|cff7ec8ff[open]|r|h"
+local ECHO_DEFAULT = 4000 -- characters of a message to print into the game chat ("/wa echo <n>")
+
+local function OpenLink(chat)
+	return "|Hwhatsapp:open:" .. chat.id .. "|h|cff7ec8ff[open]|r|h"
 end
 
--- Print a reply into the game chat: prefix on the first line, then the text line
--- by line up to the limit, then clickable links. `short` prints one preview line.
-local function EchoToChat(chat, text, label, color, sender)
+-- Print an incoming message into the game chat, whisper style: the name is a
+-- link that starts a reply in the chat box. `short` prints one preview line.
+local function EchoToChat(chat, text, sender)
 	local mode = db.settings.echo
 	if mode == "off" then return end
-	local action = label == "WhatsApp" and "whatsapp" or "open"
-	local prefix = "|Hwhatsapp:" .. action .. ":" .. chat.id .. "|h|cff" .. (color or "7ec8ff")
-		.. "[" .. (label or "WhatsApp") .. " · " .. Display(chat.name)
-		.. (sender and sender ~= "" and " · " .. Display(sender) or "") .. "]|r|h "
+	local who = Display(chat.name) .. (sender and sender ~= "" and (" · " .. Display(sender)) or "")
+	local prefix = "|cff25d366WhatsApp|r |Hwhatsapp:whatsapp:" .. chat.id .. "|h|cff66ffcc[" .. who .. "]|r|h: "
 	local body = Display(text)
 	if mode == "short" then
 		local flat = (body:gsub("%s+", " "))
 		if #flat > 200 then flat = flat:sub(1, 200) .. " ..." end
-		print(prefix .. flat .. ChatLinks(chat))
+		print(prefix .. flat .. "  " .. OpenLink(chat))
 		return
 	end
 	local limit = tonumber(mode) or ECHO_DEFAULT
@@ -1851,33 +1804,19 @@ local function EchoToChat(chat, text, label, color, sender)
 			shown = shown + #line
 		end
 	end
-	print("    " .. ChatLinks(chat):sub(3))
+	print("    " .. OpenLink(chat))
 end
 
-NotifyWhatsApp = function(chat, text, sender)
-	pcall(PlaySound, 3081)
-	WoWWhatsApp.UpdateMini()
-	run.lastMessenger = "whatsapp"
-	run.lastReplyChat = chat.id
-	EchoToChat(chat, text, "WhatsApp", "66ffcc", sender)
-	if ui.frame and ui.frame:IsShown() and db.activeChat == chat.id then return end
-	if UIErrorsFrame then
-		UIErrorsFrame:AddMessage("WhatsApp: " .. Display(chat.name), 0.4, 1, 0.8, 1)
-	end
-end
-
--- A reply landed. Always play the sound and echo it to the game chat; if that
--- chat isn't on screen, also flash the screen text and light up the mini bar.
-function WoWWhatsApp.Notify(chat, text)
+NotifyIncoming = function(chat, text, sender)
 	pcall(PlaySound, 3081)
 	WoWWhatsApp.UpdateMini()
 	-- Until a real whisper arrives, /r replies to this chat.
 	run.lastMessenger = "whatsapp"
 	run.lastReplyChat = chat.id
-	EchoToChat(chat, text)
+	EchoToChat(chat, text, sender)
 	if ui.frame and ui.frame:IsShown() and db.activeChat == chat.id then return end
 	if UIErrorsFrame then
-		UIErrorsFrame:AddMessage("WhatsApp replied in " .. Display(chat.name), 0.5, 0.8, 1, 1)
+		UIErrorsFrame:AddMessage("WhatsApp: " .. Display(chat.name), 0.4, 1, 0.8, 1)
 	end
 end
 
@@ -1888,35 +1827,29 @@ end
 -- settings); instead the box remembers a WhatsApp target, the header is repainted
 -- over the game's own, and the send entry points are intercepted. Any other chat
 -- type, Tab, Esc or a cleared box drops the target again.
-local WHATSAPP_R, WHATSAPP_G, WHATSAPP_B = 0.49, 0.78, 1.0
-
-local function PaintTargetHeader(eb, chat, messenger)
+local function PaintTargetHeader(eb, chat)
 	local header = _G[eb:GetName() .. "Header"]
 	local suffix = _G[eb:GetName() .. "HeaderSuffix"]
 	if not header then return end
-	local label = messenger == "whatsapp" and "WhatsApp" or "WhatsApp"
-	local r, g, b = messenger == "whatsapp" and 0.4 or WHATSAPP_R, messenger == "whatsapp" and 1 or WHATSAPP_G, messenger == "whatsapp" and 0.8 or WHATSAPP_B
 	eb.whatsappPainting = true
 	eb:UpdateHeader() -- lay out normally first, then repaint
 	eb.whatsappPainting = nil
 	header:SetWidth(0)
-	header:SetText("To " .. label .. " [" .. Display(chat.name) .. "]: ")
-	header:SetTextColor(r, g, b)
+	header:SetText("To WhatsApp [" .. Display(chat.name) .. "]: ")
+	header:SetTextColor(0.4, 1, 0.8)
 	if suffix then suffix:Hide() end
 	eb:SetTextInsets(15 + header:GetWidth(), 13, 0, 0)
-	eb:SetTextColor(r, g, b)
+	eb:SetTextColor(0.4, 1, 0.8)
 end
 
 local function SendBoxToTarget(eb)
 	local chat = FindChat(eb.whatsappTarget)
 	local text = Trim(eb:GetText() or "")
-	local messenger = eb.whatsappMessenger
 	eb.whatsappTarget = nil
-	eb.whatsappMessenger = nil
 	eb:ClearChat()
 	if chat and db.activeChat ~= chat.id then WoWWhatsApp.SwitchChat(chat.id) end
 	if text ~= "" then
-		WoWWhatsApp.Send(text)
+		WoWWhatsApp.Send(text, chat)
 	else
 		WoWWhatsApp.Toggle(true)
 		if ui.input then ui.input:SetFocus() end
@@ -1935,21 +1868,17 @@ local function HookReplyCommand()
 					self.whatsappTarget = nil
 					return origProcess(self, msg, index, send, ...)
 				end
-				if not (db and (run.lastMessenger == "whatsapp" or run.lastMessenger == "whatsapp")) then
+				if not (db and run.lastMessenger == "whatsapp") then
 					return origProcess(self, msg, index, send, ...)
 				end
 				local chat = FindChat(run.lastReplyChat) or ActiveChat()
+				self.whatsappTarget = chat and chat.id
+				self:SetText(msg or "")
 				if send == 1 then
-					self:SetText(msg or "")
-					self.whatsappTarget = chat and chat.id
-					self.whatsappMessenger = run.lastMessenger
 					SendBoxToTarget(self)
 					return true
 				end
-				self.whatsappTarget = chat and chat.id
-				self.whatsappMessenger = run.lastMessenger
-				self:SetText(msg or "")
-				if chat then PaintTargetHeader(self, chat, run.lastMessenger) end
+				if chat then PaintTargetHeader(self, chat) end
 				return true
 			end
 
@@ -1978,7 +1907,7 @@ local function HookReplyCommand()
 	end
 end
 
--- Clicks on our [reply] / [open] links in the chat frame.
+-- Clicks on our name / [open] links in the chat frame.
 hooksecurefunc("SetItemRef", function(link)
 	local action, chatId = tostring(link):match("^whatsapp:(%a+):(.+)$")
 	if not action or not db then return end
@@ -1992,14 +1921,12 @@ hooksecurefunc("SetItemRef", function(link)
 			ChatEdit_ActivateChat(eb)
 			eb:SetChatType("REPLY")
 			eb.whatsappTarget = chat.id
-			eb.whatsappMessenger = "whatsapp"
 			eb:SetText("")
-			PaintTargetHeader(eb, chat, "whatsapp")
+			PaintTargetHeader(eb, chat)
 		end
 		return
 	end
 	WoWWhatsApp.Toggle(true)
-	if action == "reply" and ui.input then ui.input:SetFocus() end
 end)
 
 -- Shift-clicking an item, spell, quest or name puts its link into the chat box
@@ -2022,18 +1949,8 @@ elseif type(ChatEdit_InsertLink) == "function" then
 end
 
 ---------------------------------------------------------------------------
--- UI
+-- Window
 ---------------------------------------------------------------------------
-
-local function MakeButton(parent, label, width, onClick)
-	local b = CreateFrame("Button", nil, parent, "UIPanelButtonTemplate")
-	b:SetSize(width, 22)
-	b:SetText(label)
-	b:SetScript("OnClick", onClick)
-	return b
-end
-
-local PANEL_W = 150
 
 local function BuildUI()
 	if ui.frame then return end
@@ -2051,7 +1968,7 @@ local function BuildUI()
 	f:SetMovable(true)
 	f:SetResizable(true)
 	f:SetClampedToScreen(true)
-	f:SetResizeBounds(560, 300)
+	f:SetResizeBounds(600, 340)
 	f:EnableMouse(true)
 	f:RegisterForDrag("LeftButton")
 	f:SetScript("OnDragStart", f.StartMoving)
@@ -2060,9 +1977,9 @@ local function BuildUI()
 		local point, _, relPoint, x, y = self:GetPoint()
 		s.point, s.relPoint, s.x, s.y = point, relPoint, x, y
 	end)
-	f:SetBackdrop(BACKDROP)
-	f:SetBackdropColor(0.05, 0.05, 0.07, 0.95)
-	f:SetBackdropBorderColor(0.6, 0.6, 0.6, 1)
+	f:SetBackdrop({ bgFile = FLAT, edgeFile = FLAT, edgeSize = 1 })
+	f:SetBackdropColor(COLOR.frame[1], COLOR.frame[2], COLOR.frame[3], COLOR.frame[4])
+	f:SetBackdropBorderColor(COLOR.border[1], COLOR.border[2], COLOR.border[3], 1)
 	f:Hide()
 	tinsert(UISpecialFrames, "WoWWhatsAppFrame")
 
@@ -2083,48 +2000,30 @@ local function BuildUI()
 		return holder, dot
 	end
 
+	-- Title bar
+	local bar = f:CreateTexture(nil, "ARTWORK")
+	bar:SetPoint("TOPLEFT", f, "TOPLEFT", 1, -1)
+	bar:SetPoint("TOPRIGHT", f, "TOPRIGHT", -1, -1)
+	bar:SetHeight(TITLE_H)
+	Paint(bar, COLOR.header)
+
 	local dotHolder, dot = MakeDot(f)
-	dotHolder:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -16)
+	dotHolder:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -8)
 	ui.dot = dot
-
-	local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-	title:SetPoint("LEFT", dotHolder, "RIGHT", 6, 0)
-	title:SetText("WoW WhatsApp")
-	ui.title = title
-
-	local status = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-	status:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -34)
-	status:SetPoint("RIGHT", f, "RIGHT", -60, 0)
-	status:SetJustifyH("LEFT")
-	ui.status = status
+	local brand = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+	brand:SetPoint("LEFT", dotHolder, "RIGHT", 6, 0)
+	brand:SetText("WhatsApp")
+	brand:SetTextColor(1, 1, 1)
 
 	-- Minimize button in the corner where a close X would be: this window is never
 	-- closed from here, only collapsed to the mini bar (Esc does the same, see OnHide).
 	-- The mini bar's own X is the one that hides everything.
-	local mini
-	if C_Texture and C_Texture.GetAtlasExists and C_Texture.GetAtlasExists("RedButton-MiniCondense") then
-		-- Blizzard's own minimize button: the close button's chrome with a "condense" glyph.
-		local ok, b = pcall(CreateFrame, "Button", nil, f, "UIPanelHideButtonNoScripts")
-		if ok and b then mini = b end
-	end
-	if not mini then
-		-- Older art: draw a dash on a plain button.
-		mini = CreateFrame("Button", nil, f)
-		mini:SetSize(24, 24)
-		local dash = mini:CreateTexture(nil, "ARTWORK")
-		dash:SetSize(10, 2)
-		dash:SetPoint("CENTER", mini, "CENTER", 0, -3)
-		dash:SetColorTexture(0.9, 0.9, 0.9, 1)
-		local hl = mini:CreateTexture(nil, "HIGHLIGHT")
-		hl:SetAllPoints()
-		hl:SetColorTexture(1, 1, 1, 0.15)
-	end
-	mini:SetPoint("TOPRIGHT", f, "TOPRIGHT", -4, -4)
-	mini:SetScript("OnClick", function() WoWWhatsApp.Minimize(true) end)
+	local mini = FlatButton(f, "_", 26, 22, function() WoWWhatsApp.Minimize(true) end, { 0, 0, 0, 0.0 })
+	mini:SetPoint("TOPRIGHT", f, "TOPRIGHT", -4, -5)
 	mini:SetScript("OnEnter", function(self)
 		GameTooltip:SetOwner(self, "ANCHOR_LEFT")
 		GameTooltip:SetText("Minimize to the small bar  (Esc)")
-		GameTooltip:AddLine("WhatsApp keeps working; the bar shows when a reply lands.", 0.8, 0.8, 0.8, true)
+		GameTooltip:AddLine("Messages keep arriving; the bar shows when one lands.", 0.8, 0.8, 0.8, true)
 		GameTooltip:Show()
 	end)
 	mini:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -2142,37 +2041,78 @@ local function BuildUI()
 		WoWWhatsApp.UpdateMini()
 	end)
 
-	-- Left panel: chat list
-	local panel = CreateFrame("Frame", nil, f, "BackdropTemplate")
-	panel:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -52)
-	panel:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 14, 50)
-	panel:SetWidth(PANEL_W)
-	panel:SetBackdrop({
-		bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
-		edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-		tile = true, tileSize = 16, edgeSize = 12,
-		insets = { left = 3, right = 3, top = 3, bottom = 3 },
-	})
-	panel:SetBackdropColor(0, 0, 0, 0.4)
-	panel:SetBackdropBorderColor(0.4, 0.4, 0.4, 1)
+	-- Left panel: search, new chat, chat list
+	local panel = CreateFrame("Frame", nil, f)
+	panel:SetPoint("TOPLEFT", f, "TOPLEFT", 1, -(TITLE_H + 1))
+	panel:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 1, 1)
+	panel:SetWidth(LIST_W)
+	local panelBg = panel:CreateTexture(nil, "BACKGROUND")
+	panelBg:SetAllPoints()
+	Paint(panelBg, COLOR.panel)
+	local divider = f:CreateTexture(nil, "BORDER")
+	divider:SetPoint("TOPLEFT", panel, "TOPRIGHT", 0, 0)
+	divider:SetPoint("BOTTOMLEFT", panel, "BOTTOMRIGHT", 0, 0)
+	divider:SetWidth(1)
+	Paint(divider, COLOR.border)
 
-	local newBtn = MakeButton(panel, "+ New chat", PANEL_W - 16, function() WoWWhatsApp.NewChat() end)
-	newBtn:SetPoint("TOP", panel, "TOP", 0, -8)
+	local newBtn = FlatButton(panel, "+", 28, 28, function() WoWWhatsApp.NewChatPrompt() end, COLOR.accent)
+	newBtn.label:SetTextColor(0.02, 0.1, 0.05)
+	newBtn:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -8, -8)
+	newBtn:SetScript("OnEnter", function(self)
+		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+		GameTooltip:SetText("New chat (phone number)")
+		GameTooltip:Show()
+	end)
+	newBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
-	-- Per-chat menu: Rename and Folder, opened by right-clicking a chat row. A
-	-- plain frame of our own rather than a Blizzard dropdown, so it looks the
-	-- same on every client.
+	local searchBg = CreateFrame("Frame", nil, panel)
+	searchBg:SetPoint("TOPLEFT", panel, "TOPLEFT", 8, -8)
+	searchBg:SetPoint("RIGHT", newBtn, "LEFT", -6, 0)
+	searchBg:SetHeight(28)
+	local searchTex = searchBg:CreateTexture(nil, "BACKGROUND")
+	searchTex:SetAllPoints()
+	Paint(searchTex, COLOR.field)
+	local search = CreateFrame("EditBox", "WoWWhatsAppSearch", searchBg)
+	search:SetPoint("TOPLEFT", searchBg, "TOPLEFT", 8, 0)
+	search:SetPoint("BOTTOMRIGHT", searchBg, "BOTTOMRIGHT", -8, 0)
+	search:SetAutoFocus(false)
+	search:SetFontObject(ChatFontNormal)
+	search:SetMaxLetters(40)
+	local searchHint = searchBg:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+	searchHint:SetPoint("LEFT", searchBg, "LEFT", 8, 0)
+	searchHint:SetText("Search chats")
+	search:SetScript("OnTextChanged", function(self)
+		local text = Trim(self:GetText() or "")
+		ui.filter = text
+		searchHint:SetShown(text == "")
+		WoWWhatsApp.RenderChatList()
+	end)
+	search:SetScript("OnEscapePressed", function(self)
+		self:SetText("")
+		self:ClearFocus()
+	end)
+	search:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
+	ui.search = search
+
+	local listScroll = CreateFrame("ScrollFrame", "WoWWhatsAppList", panel)
+	listScroll:SetPoint("TOPLEFT", panel, "TOPLEFT", 0, -44)
+	listScroll:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", 0, 4)
+	local listContent = CreateFrame("Frame", "WoWWhatsAppListContent", listScroll)
+	listContent:SetSize(LIST_W, 1)
+	listScroll:SetScrollChild(listContent)
+	WheelScroll(listScroll, ROW_H)
+	ui.listScroll, ui.listContent, ui.rows = listScroll, listContent, {}
+	listScroll:HookScript("OnSizeChanged", function(self, w) listContent:SetWidth(w) end)
+
+	-- Per-chat menu, opened by right-clicking a chat row. A plain frame of our
+	-- own rather than a Blizzard dropdown, so it looks the same on every client.
+	local MENU_W, MENU_ITEM = 130, 22
 	local menu = CreateFrame("Frame", "WoWWhatsAppChatMenu", f, "BackdropTemplate")
-	menu:SetSize(110, 3 * 20 + 12)
+	menu:SetSize(MENU_W, 4 * MENU_ITEM + 28)
 	menu:SetFrameStrata("TOOLTIP")
-	menu:SetBackdrop({
-		bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
-		edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-		tile = true, tileSize = 16, edgeSize = 12,
-		insets = { left = 3, right = 3, top = 3, bottom = 3 },
-	})
-	menu:SetBackdropColor(0.08, 0.08, 0.1, 0.97)
-	menu:SetBackdropBorderColor(0.6, 0.6, 0.6, 1)
+	menu:SetBackdrop({ bgFile = FLAT, edgeFile = FLAT, edgeSize = 1 })
+	menu:SetBackdropColor(0.10, 0.11, 0.14, 0.98)
+	menu:SetBackdropBorderColor(COLOR.border[1], COLOR.border[2], COLOR.border[3], 1)
 	menu:EnableMouse(true)
 	menu.title = menu:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
 	menu.title:SetPoint("TOPLEFT", menu, "TOPLEFT", 10, -8)
@@ -2181,11 +2121,11 @@ local function BuildUI()
 	menu.title:SetWordWrap(false)
 	local function MenuItem(label, order, onClick)
 		local it = CreateFrame("Button", nil, menu)
-		it:SetSize(110 - 12, 20)
-		it:SetPoint("TOPLEFT", menu, "TOPLEFT", 6, -6 - order * 20)
+		it:SetSize(MENU_W - 8, MENU_ITEM)
+		it:SetPoint("TOPLEFT", menu, "TOPLEFT", 4, -22 - (order - 1) * MENU_ITEM)
 		local hl = it:CreateTexture(nil, "HIGHLIGHT")
 		hl:SetAllPoints()
-		hl:SetColorTexture(1, 1, 1, 0.12)
+		hl:SetColorTexture(1, 1, 1, 0.10)
 		it.label = it:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 		it.label:SetPoint("LEFT", it, "LEFT", 6, 0)
 		it.label:SetText(label)
@@ -2196,7 +2136,12 @@ local function BuildUI()
 		return it
 	end
 	MenuItem("Rename...", 1, WoWWhatsApp.RenamePrompt)
-	MenuItem("Folder...", 2, WoWWhatsApp.FolderPrompt)
+	MenuItem("Mark as read", 2, function(id)
+		local c = FindChat(id)
+		if c then c.unread = 0 WoWWhatsApp.Render() end
+	end)
+	MenuItem("Clear history", 3, WoWWhatsApp.ClearChat)
+	MenuItem("Delete...", 4, WoWWhatsApp.ConfirmDelete)
 	-- Close once the mouse has wandered away from the menu and the row it came from.
 	menu:SetScript("OnUpdate", function(self, dt)
 		if not MouseIsOver then return end
@@ -2222,186 +2167,155 @@ local function BuildUI()
 		menu.away = 0
 		menu.title:SetText(Display(c.name))
 		menu:ClearAllPoints()
-		menu:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 8, 2)
+		menu:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 40, 2)
 		menu:Show()
 	end
 
-	ui.chatButtons = {}
-	for i = 1, MAX_CHATS do
-		local b = CreateFrame("Button", nil, panel)
-		b:SetSize(PANEL_W - 16, 20)
-		b:SetPoint("TOP", newBtn, "BOTTOM", 0, -6 - (i - 1) * 21)
-		b.selected = b:CreateTexture(nil, "BACKGROUND")
-		b.selected:SetAllPoints()
-		b.selected:SetColorTexture(1, 1, 1, 0.12)
-		b.selected:Hide()
-		local hl = b:CreateTexture(nil, "HIGHLIGHT")
-		hl:SetAllPoints()
-		hl:SetColorTexture(1, 1, 1, 0.08)
+	-- Right pane header: avatar, name, status line, and the buttons that only show when needed
+	local header = f:CreateTexture(nil, "ARTWORK")
+	header:SetPoint("TOPLEFT", panel, "TOPRIGHT", 1, 0)
+	header:SetPoint("TOPRIGHT", f, "TOPRIGHT", -1, -(TITLE_H + 1))
+	header:SetHeight(HEADER_H)
+	Paint(header, COLOR.panel)
 
-		-- Trash can: delete this chat (asks first). Blizzard's red delete button
-		-- where the client has it, a plain X elsewhere.
-		b.del = CreateFrame("Button", nil, b)
-		b.del:SetSize(16, 16)
-		b.del:SetPoint("RIGHT", b, "RIGHT", -2, 0)
-		if C_Texture and C_Texture.GetAtlasExists and C_Texture.GetAtlasExists("128-RedButton-Delete") then
-			b.del:SetNormalAtlas("128-RedButton-Delete")
-			b.del:SetPushedAtlas("128-RedButton-Delete-Pressed")
-			b.del:SetHighlightAtlas("128-RedButton-Delete-Highlight")
-		else
-			b.del:SetNormalTexture("Interface\\Buttons\\UI-GroupLoot-Pass-Up")
-			b.del:SetHighlightTexture("Interface\\Buttons\\UI-GroupLoot-Pass-Highlight")
-		end
-		b.del:SetAlpha(0.6)
-		b.del:SetScript("OnClick", function() WoWWhatsApp.ConfirmDelete(b.chatId) end)
-		b.del:SetScript("OnEnter", function(self)
-			self:SetAlpha(1)
-			GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-			GameTooltip:SetText("Delete this chat")
-			GameTooltip:Show()
-		end)
-		b.del:SetScript("OnLeave", function(self)
-			self:SetAlpha(0.6)
-			GameTooltip:Hide()
-		end)
+	local avatar = f:CreateTexture(nil, "OVERLAY")
+	avatar:SetSize(32, 32)
+	avatar:SetPoint("TOPLEFT", header, "TOPLEFT", 10, -6)
+	avatar:SetColorTexture(0.3, 0.3, 0.3, 1)
+	Round(avatar, f)
+	ui.avatar = avatar
+	ui.avatarInitial = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+	ui.avatarInitial:SetPoint("CENTER", avatar, "CENTER", 0, 0)
+	ui.avatarInitial:SetTextColor(1, 1, 1)
 
-		b.label = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-		b.label:SetPoint("LEFT", b, "LEFT", 6, 0)
-		b.label:SetPoint("RIGHT", b.del, "LEFT", -4, 0)
-		b.label:SetJustifyH("LEFT")
-		b.label:SetWordWrap(false)
-		-- Left-click switches to the chat; right-click opens its menu (Rename,
-		-- Folder). A second right-click on the same row closes the menu again.
-		b:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-		b:SetScript("OnClick", function(self, button)
-			if button == "RightButton" then
-				WoWWhatsApp.ShowChatMenu(self.chatId, self)
-			else
-				WoWWhatsApp.SwitchChat(self.chatId)
-			end
-		end)
-		b:SetScript("OnDoubleClick", function(self)
-			WoWWhatsApp.SwitchChat(self.chatId)
-			WoWWhatsApp.RenamePrompt(self.chatId)
-		end)
-		b:Hide()
-		ui.chatButtons[i] = b
-	end
+	local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+	title:SetPoint("TOPLEFT", avatar, "TOPRIGHT", 10, 2)
+	title:SetPoint("RIGHT", f, "RIGHT", -170, 0)
+	title:SetJustifyH("LEFT")
+	title:SetWordWrap(false)
+	title:SetTextColor(COLOR.text[1], COLOR.text[2], COLOR.text[3])
+	ui.title = title
 
-	-- Transcript: a scrolling stack of message bubbles
-	local scroll = CreateFrame("ScrollFrame", "WoWWhatsAppScroll", f, "UIPanelScrollFrameTemplate")
-	scroll:SetPoint("TOPLEFT", panel, "TOPRIGHT", 8, 0)
-	scroll:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -32, 110)
-	ui.scroll = scroll
+	local status = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+	status:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -2)
+	status:SetPoint("RIGHT", f, "RIGHT", -170, 0)
+	status:SetJustifyH("LEFT")
+	status:SetWordWrap(false)
+	ui.status = status
 
-	local content = CreateFrame("Frame", "WoWWhatsAppContent", scroll)
-	content:SetSize(500, 1)
-	scroll:SetScrollChild(content)
-	ui.content = content
-	ui.bubbles = {}
-	scroll:HookScript("OnSizeChanged", function(self, w, h)
-		if ui.frame:IsShown() then WoWWhatsApp.Render() end
-	end)
+	-- Reload is the fallback transport's button; Resend puts a stuck message back on the strip.
+	local refresh = FlatButton(f, "Reload", 56, 22, function() SafeReload() end)
+	refresh:SetPoint("TOPRIGHT", f, "TOPRIGHT", -10, -(TITLE_H + 12))
+	refresh:Hide()
+	ui.refresh = refresh
+	local resend = FlatButton(f, "Resend", 56, 22, WoWWhatsApp.Resend)
+	resend:SetPoint("RIGHT", refresh, "LEFT", -6, 0)
+	resend:Hide()
+	ui.resend = resend
 
-	-- Input box, with Send docked at its right end like a messaging app.
-	local SEND_W = 84
-	local inputBg = CreateFrame("Frame", nil, f, "BackdropTemplate")
-	inputBg:SetPoint("BOTTOMLEFT", panel, "BOTTOMRIGHT", 8, 0)
-	inputBg:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -14 - SEND_W - 6, 50)
-	inputBg:SetHeight(54)
-	inputBg:SetBackdrop({
-		bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
-		edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-		tile = true, tileSize = 16, edgeSize = 12,
-		insets = { left = 3, right = 3, top = 3, bottom = 3 },
-	})
-	inputBg:SetBackdropColor(0, 0, 0, 0.6)
-	inputBg:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
+	-- Conversation
+	local areaBg = f:CreateTexture(nil, "BACKGROUND")
+	areaBg:SetPoint("TOPLEFT", header, "BOTTOMLEFT", 0, 0)
+	areaBg:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -1, 1)
+	Paint(areaBg, COLOR.area)
 
-	local inScroll = CreateFrame("ScrollFrame", "WoWWhatsAppInputScroll", inputBg, "UIPanelScrollFrameTemplate")
-	inScroll:SetPoint("TOPLEFT", inputBg, "TOPLEFT", 8, -6)
-	inScroll:SetPoint("BOTTOMRIGHT", inputBg, "BOTTOMRIGHT", -24, 6)
+	-- Composer: input box with Send docked at its right end, like a messaging app.
+	local SEND_W = 70
+	local inputBg = CreateFrame("Frame", nil, f)
+	inputBg:SetPoint("BOTTOMLEFT", panel, "BOTTOMRIGHT", 10, 10)
+	inputBg:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -10 - SEND_W - 6, 10)
+	inputBg:SetHeight(38)
+	local inputTex = inputBg:CreateTexture(nil, "BACKGROUND")
+	inputTex:SetAllPoints()
+	Paint(inputTex, COLOR.field)
+	ui.inputBg = inputBg
+
+	local inScroll = CreateFrame("ScrollFrame", "WoWWhatsAppInputScroll", inputBg)
+	inScroll:SetPoint("TOPLEFT", inputBg, "TOPLEFT", 10, -7)
+	inScroll:SetPoint("BOTTOMRIGHT", inputBg, "BOTTOMRIGHT", -10, 7)
+	WheelScroll(inScroll, 14)
 
 	local input = CreateFrame("EditBox", "WoWWhatsAppInput", inScroll)
 	input:SetMultiLine(true)
 	input:SetAutoFocus(false)
 	input:SetFontObject(ChatFontNormal)
 	input:SetMaxLetters(0)
-	input:SetSize(500, 40)
+	input:SetSize(400, 20)
 	input:SetScript("OnEnterPressed", function() WoWWhatsApp.SendFromInput() end)
 	input:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
 	inScroll:SetScrollChild(input)
 	inScroll:HookScript("OnSizeChanged", function(self, w, h)
 		input:SetWidth(w)
 	end)
+	inputBg:EnableMouse(true)
 	inputBg:SetScript("OnMouseDown", function() input:SetFocus() end)
 	ui.input = input
 
-	-- Send sits to the right of the input box, vertically centred on it.
-	local send = MakeButton(f, "Send", SEND_W, WoWWhatsApp.SendFromInput)
-	send:SetHeight(30)
-	send:SetPoint("LEFT", inputBg, "RIGHT", 6, 0)
+	local placeholder = inputBg:CreateFontString(nil, "OVERLAY", "GameFontDisable")
+	placeholder:SetPoint("LEFT", inputBg, "LEFT", 12, 0)
+	placeholder:SetText("Type a message")
+	input:SetScript("OnTextChanged", function(self)
+		local empty = (self:GetText() or "") == ""
+		placeholder:SetShown(empty)
+		-- The box grows with what is typed, up to about five lines.
+		local h = empty and 20 or (self:GetHeight() or 20)
+		inputBg:SetHeight(math.max(38, math.min(110, h + 18)))
+	end)
+
+	local send = FlatButton(f, "Send", SEND_W, 38, WoWWhatsApp.SendFromInput, COLOR.accent)
+	send.label:SetTextColor(0.02, 0.1, 0.05)
+	send:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -10, 10)
 	ui.send = send
 
 	-- Connect stands in for Send until the bridge has been seen (see UpdateConnect).
-	local connect = MakeButton(f, "Connect", SEND_W, WoWWhatsApp.Connect)
-	connect:SetHeight(30)
-	connect:SetPoint("LEFT", inputBg, "RIGHT", 6, 0)
+	local connect = FlatButton(f, "Connect", SEND_W, 38, WoWWhatsApp.Connect, COLOR.header)
+	connect:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -10, 10)
 	connect:SetScript("OnEnter", function(self)
 		GameTooltip:SetOwner(self, "ANCHOR_TOP")
 		GameTooltip:SetText("Connect to the bridge")
-		GameTooltip:AddLine("The bridge must be running on this PC (npm start in wow-whatsapp, or wow-whatsapp in your project). The light turns green once it answers.", 0.8, 0.8, 0.8, true)
+		GameTooltip:AddLine("The bridge must be running on this PC (npm start in wow-whatsapp). The light turns green once it answers.", 0.8, 0.8, 0.8, true)
 		GameTooltip:Show()
 	end)
 	connect:SetScript("OnLeave", function() GameTooltip:Hide() end)
 	connect:Hide()
 	ui.connect = connect
 
-	-- Reload is the fallback transport's button; it sits apart on the right and
-	-- only shows when a reload would do something (see UpdateStatus).
-	local refresh = MakeButton(f, "Reload", 70, function() SafeReload() end)
-	refresh:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -24, 16)
-	refresh:Hide()
-	ui.refresh = refresh
+	local scroll = CreateFrame("ScrollFrame", "WoWWhatsAppScroll", f)
+	-- Opposite corners, so the rectangle is fully defined without over-constraining it.
+	scroll:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -(TITLE_H + HEADER_H + 4))
+	scroll:SetPoint("BOTTOMLEFT", inputBg, "TOPLEFT", -10, 8)
+	WheelScroll(scroll, 60)
+	ui.scroll = scroll
 
-	-- Bottom row: Clear, plus Resend while a message is in flight. Rename, Folder
-	-- and Delete live on each chat row in the left panel.
-	local clear = MakeButton(f, "Clear", 60, function()
-		local c = ActiveChat()
-		if c then wipe(c.history) end
-		WoWWhatsApp.Render()
+	local content = CreateFrame("Frame", "WoWWhatsAppContent", scroll)
+	content:SetSize(500, 1)
+	scroll:SetScrollChild(content)
+	ui.content = content
+	ui.items = {}
+	ui.measure = f:CreateFontString(nil, "ARTWORK", "ChatFontNormal")
+	ui.measure:SetPoint("TOPLEFT", f, "TOPLEFT", 0, 0)
+	ui.measure:SetAlpha(0)
+	scroll:HookScript("OnSizeChanged", function(self, w, h)
+		if ui.frame:IsShown() then WoWWhatsApp.Render() end
 	end)
-	clear:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 14, 16)
 
-	local resend = MakeButton(f, "Resend", 70, WoWWhatsApp.Resend)
-	resend:SetPoint("LEFT", clear, "RIGHT", 6, 0)
-	resend:Hide()
-	ui.resend = resend
-
-	-- A named, always-present button so a keybinding can click it (see /wow-whatsapp bind).
+	-- A named, always-present button so a keybinding can click it (see /wa bind).
 	local hotkey = CreateFrame("Button", "WoWWhatsAppRefreshButton", UIParent)
 	hotkey:SetSize(1, 1)
 	hotkey:SetPoint("TOPLEFT", UIParent, "TOPLEFT", -10, 10)
 	hotkey:SetScript("OnClick", function()
 		local c = ActiveChat()
 		if c and c.pendingId then
-			WoWWhatsApp.Send("")
+			TryLoadSlot("manual")
 		else
 			WoWWhatsApp.Toggle()
 		end
 	end)
 
-	local cwd = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-	cwd:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 16, 4)
-	cwd:SetPoint("RIGHT", f, "RIGHT", -30, 0)
-	cwd:SetJustifyH("LEFT")
-	cwd:SetWordWrap(false)
-	ui.cwd = cwd
-
 	-- Resize grip
 	local grip = CreateFrame("Button", nil, f)
 	grip:SetSize(16, 16)
-	grip:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -5, 5)
+	grip:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -2, 2)
 	grip:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
 	grip:SetHighlightTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Highlight")
 	grip:SetPushedTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Down")
@@ -2440,9 +2354,9 @@ local function BuildUI()
 			WoWWhatsApp.Minimize(false)
 		end
 	end)
-	m:SetBackdrop(BACKDROP)
-	m:SetBackdropColor(0.05, 0.05, 0.07, 0.95)
-	m:SetBackdropBorderColor(0.6, 0.6, 0.6, 1)
+	m:SetBackdrop({ bgFile = FLAT, edgeFile = FLAT, edgeSize = 1 })
+	m:SetBackdropColor(COLOR.header[1], COLOR.header[2], COLOR.header[3], 0.97)
+	m:SetBackdropBorderColor(COLOR.border[1], COLOR.border[2], COLOR.border[3], 1)
 	m:Hide()
 
 	local miniDotHolder, miniDot = MakeDot(m)
@@ -2451,7 +2365,8 @@ local function BuildUI()
 
 	local mlabel = m:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 	mlabel:SetPoint("LEFT", miniDotHolder, "RIGHT", 6, 0)
-	mlabel:SetText("WoW WhatsApp")
+	mlabel:SetText("WhatsApp")
+	mlabel:SetTextColor(1, 1, 1)
 
 	local badge = m:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 	badge:SetPoint("LEFT", mlabel, "RIGHT", 8, 0)
@@ -2483,7 +2398,7 @@ local function BuildUI()
 	mclose:SetScript("OnClick", function() WoWWhatsApp.Toggle(false) end)
 	mclose:SetScript("OnEnter", function(self)
 		GameTooltip:SetOwner(self, "ANCHOR_LEFT")
-		GameTooltip:SetText("Quit: hide completely (/wow-whatsapp brings it back)")
+		GameTooltip:SetText("Quit: hide completely (/wa brings it back)")
 		GameTooltip:Show()
 	end)
 	mclose:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -2496,6 +2411,7 @@ function WoWWhatsApp.Toggle(show)
 		db.settings.minimized = false
 		local c = ActiveChat()
 		if c then c.unread = 0 end
+		run.scrollToEnd = true
 	end
 	if ui.mini then ui.mini:Hide() end
 	if not show then ui.quitting = true end
@@ -2530,24 +2446,22 @@ end
 ---------------------------------------------------------------------------
 
 local HELP = table.concat({
-	"/wow-whatsapp                    toggle the WhatsApp window (/wa also works)",
-	"/wow-whatsapp mini               collapse to the small bar",
-	"/wow-whatsapp hide               hide the window completely",
-	"/ai <text>                       send text to the current WhatsApp chat",
-	"/r <text>                        reply to the last WhatsApp message",
-	"/wow-whatsapp <text>             same as /ai",
-	"/wow-whatsapp new [name]         create a new WhatsApp chat",
-	"/wow-whatsapp chat <n|name>      switch chats",
-	"/wow-whatsapp rename [name]      rename the current chat",
-	"/wow-whatsapp cd <folder>        keep a local folder label for this chat",
-	"/wow-whatsapp delete             delete the current chat",
-	"/wow-whatsapp clear              clear this chat's transcript",
-	"/wow-whatsapp echo full|short|off  control messages echoed to game chat",
-	"/wow-whatsapp mode pixel|reload  choose normal or reload fallback transport",
-	"/wow-whatsapp reload             reload now and free the slot pool",
-	"/wow-whatsapp copy               copy the last message",
-	"/wow-whatsapp slots              show remaining reply slots",
-	"/wow-whatsapp diag               show transport diagnostics",
+	"/wa                       toggle the WhatsApp window",
+	"/wa mini                  collapse to the small bar",
+	"/wa hide                  hide the window completely",
+	"/wa <text>                send text to the current chat (/ai <text> too)",
+	"/r <text>                 reply to the last WhatsApp message",
+	"/wa new <phone number>    start a chat (country code, digits only)",
+	"/wa chat <n|name>         switch chats",
+	"/wa rename [name]         rename the current chat",
+	"/wa delete                delete the current chat",
+	"/wa clear                 clear this chat's history",
+	"/wa echo full|short|off   incoming messages echoed to the game chat",
+	"/wa mode pixel|reload     normal or reload fallback transport",
+	"/wa reload                reload now and free the slot pool",
+	"/wa copy                  copy the last received message",
+	"/wa slots                 show remaining reply slots",
+	"/wa diag                  show transport diagnostics",
 }, "\n")
 
 -- /ai <text>: send straight from the game chat box (like /r, but for WhatsApp).
@@ -2568,16 +2482,28 @@ local function ApplyLongChat()
 	box:SetMaxLetters(db.settings.longchat and 4000 or 255)
 end
 
+local function FreeSlots()
+	local free = 0
+	for i = 1, SLOT_COUNT do
+		if not C_AddOns.IsAddOnLoaded(SlotName(i)) then free = free + 1 end
+	end
+	return free
+end
+
 SLASH_WOWWHATSAPP1 = "/wow-whatsapp"
 SLASH_WOWWHATSAPP2 = "/wa"
-SLASH_WOWWHATSAPP3 = "/wow-whatsapp" -- legacy alias
-SLASH_WOWWHATSAPP4 = "/whatsapp" -- legacy alias
+SLASH_WOWWHATSAPP3 = "/whatsapp"
 SlashCmdList["WOWWHATSAPP"] = function(msg)
 	msg = Trim(msg or "")
 	local cmd, rest = msg:match("^(%S+)%s*(.-)$")
 	cmd = cmd and cmd:lower() or ""
 	local s = db.settings
 	local c = ActiveChat()
+	local function Note(text)
+		AddHistory(c, "system", text)
+		WoWWhatsApp.Render()
+		WoWWhatsApp.Toggle(true)
+	end
 
 	if cmd == "" then
 		WoWWhatsApp.Toggle()
@@ -2592,18 +2518,21 @@ SlashCmdList["WOWWHATSAPP"] = function(msg)
 			for _, ch in ipairs(db.chats) do
 				if ch.name:lower() == rest:lower() then target = ch end
 			end
+			if not target then
+				local id = PhoneId(rest)
+				target = id and FindChat(id)
+			end
 		end
 		if target then
 			WoWWhatsApp.SwitchChat(target.id)
+			WoWWhatsApp.Toggle(true)
 		else
 			local lines = {}
 			for i, ch in ipairs(db.chats) do
-				table.insert(lines, i .. ". " .. ch.name .. (ch.id == db.activeChat and "  (current)" or "") .. (ch.pendingId and "  working" or "") .. ((ch.unread or 0) > 0 and ("  " .. ch.unread .. " new") or ""))
+				table.insert(lines, i .. ". " .. ch.name .. (ch.id == db.activeChat and "  (current)" or "") .. ((ch.unread or 0) > 0 and ("  " .. ch.unread .. " new") or ""))
 			end
-			AddHistory(c, "system", "Chats:\n" .. table.concat(lines, "\n"))
-			WoWWhatsApp.Render()
+			Note("Chats:\n" .. table.concat(lines, "\n"))
 		end
-		WoWWhatsApp.Toggle(true)
 	elseif cmd == "rename" then
 		if rest ~= "" then
 			c.name = rest:sub(1, 24)
@@ -2615,39 +2544,15 @@ SlashCmdList["WOWWHATSAPP"] = function(msg)
 		WoWWhatsApp.Toggle(true)
 	elseif cmd == "delete" then
 		WoWWhatsApp.DeleteChat()
-	elseif cmd == "cd" then
-		WoWWhatsApp.SetFolder(rest, c)
-		WoWWhatsApp.Toggle(true)
-	elseif cmd == "reset" then
-		c.resetNext = true
-		AddHistory(c, "system", "Next message starts a fresh WhatsApp session in " .. c.cwd)
-		WoWWhatsApp.Render()
-		WoWWhatsApp.Toggle(true)
-	elseif cmd == "context" or cmd == "ctx" then
-		rest = rest:lower()
-		if rest == "on" or rest == "off" then
-			s.context = rest == "on"
-			-- Make sure the next record carries the change, hello throttle or not.
-			run.contextSent = nil
-			run.lastHelloAt = nil
-			if WoWWhatsApp.IsConnected() then WoWWhatsApp.SayHello() end
-		end
-		local ctx = WoWWhatsApp.GameContext()
-		AddHistory(c, "system", (s.context
-			and "Game context is ON: WhatsApp is told this with each message (it goes into its system prompt, so unrelated projects are unaffected by anything but a few lines). /wow-whatsapp context off to stop.\n\n"
-			or "Game context is OFF: WhatsApp is told nothing about the game. /wow-whatsapp context on to send this:\n\n") .. ctx
-			.. "\n\nTip: click the input box, then shift-click an item, spell or quest to link it into your message; WhatsApp gets its tooltip.")
-		WoWWhatsApp.Render()
-		WoWWhatsApp.Toggle(true)
+	elseif cmd == "clear" then
+		WoWWhatsApp.ClearChat()
 	elseif cmd == "mode" then
 		if rest == "pixel" or rest == "reload" then
 			s.mode = rest
-			AddHistory(c, "system", "mode set to " .. rest)
+			Note("mode set to " .. rest)
 		else
-			AddHistory(c, "system", "mode is " .. s.mode .. " (pixel or reload)")
+			Note("mode is " .. s.mode .. " (pixel or reload)")
 		end
-		WoWWhatsApp.Render()
-		WoWWhatsApp.Toggle(true)
 	elseif cmd == "resend" then
 		WoWWhatsApp.Resend()
 	elseif cmd == "auto" then
@@ -2666,7 +2571,7 @@ SlashCmdList["WOWWHATSAPP"] = function(msg)
 		WoWWhatsApp.Toggle(false)
 	elseif cmd == "copy" then
 		for i = #c.history, 1, -1 do
-			if c.history[i].role == "whatsapp" then
+			if c.history[i].role == "contact" then
 				WoWWhatsApp.ShowCopy(c.history[i].text)
 				break
 			end
@@ -2677,25 +2582,16 @@ SlashCmdList["WOWWHATSAPP"] = function(msg)
 		elseif tonumber(rest) then
 			s.echo = tostring(math.max(200, math.floor(tonumber(rest))))
 		end
-		AddHistory(c, "system", "replies in game chat: " .. s.echo .. " (full = " .. ECHO_DEFAULT .. " chars, short, off, or a number of characters)")
-		WoWWhatsApp.Render()
+		Note("incoming messages in game chat: " .. s.echo .. " (full = " .. ECHO_DEFAULT .. " chars, short, off, or a number of characters)")
 	elseif cmd == "longchat" then
 		if rest == "on" then s.longchat = true elseif rest == "off" then s.longchat = false end
 		ApplyLongChat()
-		AddHistory(c, "system", "game chat box limit: " .. (s.longchat and "4000 characters (fine for /ai; real chat over 255 may be rejected by the server)" or "255 (default)"))
-		WoWWhatsApp.Render()
+		Note("game chat box limit: " .. (s.longchat and "4000 characters (fine for /ai; real chat over 255 may be rejected by the server)" or "255 (default)"))
 	elseif cmd == "signal" then
 		if rest == "on" then s.signal = true elseif rest == "off" then s.signal = false end
-		AddHistory(c, "system", "signal check is " .. (s.signal and "on" or "off"))
-		WoWWhatsApp.Render()
+		Note("signal check is " .. (s.signal and "on" or "off"))
 	elseif cmd == "slots" then
-		local free = 0
-		for i = 1, SLOT_COUNT do
-			if not C_AddOns.IsAddOnLoaded(SlotName(i)) then free = free + 1 end
-		end
-		AddHistory(c, "system", free .. " of " .. SLOT_COUNT .. " reply slots free this session (a reload frees all)")
-		WoWWhatsApp.Render()
-		WoWWhatsApp.Toggle(true)
+		Note(FreeSlots() .. " of " .. SLOT_COUNT .. " reply slots free this session (a reload frees all)")
 	elseif cmd == "refresh" or cmd == "reload" then
 		SafeReload()
 	elseif cmd == "bind" then
@@ -2703,59 +2599,43 @@ SlashCmdList["WOWWHATSAPP"] = function(msg)
 		if key ~= "" and not InCombatLockdown() then
 			SetBinding(key, "CLICK WoWWhatsAppRefreshButton:LeftButton")
 			SaveBindings(GetCurrentBindingSet())
-			AddHistory(c, "system", key .. " is now bound: checks for a reply while waiting, otherwise toggles this window")
+			Note(key .. " is now bound: checks for delivery while a message is on its way, otherwise toggles this window")
+		else
+			Note("/wa bind <KEY>, for example /wa bind F9 (not in combat)")
 		end
-		WoWWhatsApp.Render()
-		WoWWhatsApp.Toggle(true)
 	elseif cmd == "diag" then
-		local free = 0
-		for i = 1, SLOT_COUNT do
-			if not C_AddOns.IsAddOnLoaded(SlotName(i)) then free = free + 1 end
-		end
 		local lines = {
 			"sound channel: " .. (signalAvailable and "usable" or "UNUSABLE") .. " (self-test: " .. tostring(signalStats.selftest) .. ")" .. (signalStats.error and (" error: " .. signalStats.error) or ""),
 			"signal setting: " .. tostring(s.signal) .. ", marked unreliable this session: " .. tostring(run.signalUnreliable or false),
 			"sound checks: " .. signalStats.checks .. ", valid hits: " .. signalStats.hits .. (signalStats.lastHit and (", last hit " .. FmtDur(GetTime() - signalStats.lastHit) .. " ago") or ""),
-			"slot polls this session: " .. (run.polls or 0) .. ", free slots: " .. free .. "/" .. SLOT_COUNT,
+			"slot polls this session: " .. (run.polls or 0) .. ", free slots: " .. FreeSlots() .. "/" .. SLOT_COUNT,
 			"presence: head at " .. tostring(run.presence and run.presence.last or "?") .. ", beats seen: " .. tostring(run.presence and run.presence.beats or 0),
 			select(5, WoWWhatsApp.BridgeState()),
 			"mode: " .. s.mode .. ", session token: " .. tostring(db.session),
 		}
 		for _, ch in ipairs(db.chats) do
-			local a = run.act and run.act[ch.id]
-			if ch.pendingId then
-				table.insert(lines, ch.name .. ": pending #" .. ch.pendingId .. (a and (", heartbeat " .. (a.unreliable and "unreliable" or (a.count .. " beats"))) or ", no heartbeat state"))
-			end
+			if ch.pendingId then table.insert(lines, ch.name .. ": message #" .. ch.pendingId .. " not confirmed yet") end
 		end
-		AddHistory(c, "system", "Diagnostics:\n" .. table.concat(lines, "\n"))
-		WoWWhatsApp.Render()
-		WoWWhatsApp.Toggle(true)
+		Note("Diagnostics:\n" .. table.concat(lines, "\n"))
 	elseif cmd == "cancel" then
 		if c.pendingId then
+			for i = #c.history, 1, -1 do
+				local m = c.history[i]
+				if m.role == "user" and m.id == c.pendingId then m.failed = true break end
+			end
 			AddHistory(c, "system", "Gave up waiting on #" .. c.pendingId)
 			run.outbound[c.pendingId] = nil
-			if run.act then run.act[c.id] = nil end
 			c.pendingId = nil
-			c.progress = nil
 			RefreshStrip()
 			if not AnyPending() then keyCatcher:Hide() end
 		end
 		WoWWhatsApp.Render()
-	elseif cmd == "clear" then
-		wipe(c.history)
-		WoWWhatsApp.Render()
 	elseif cmd == "help" then
-		AddHistory(c, "system", HELP)
-		WoWWhatsApp.Render()
-		WoWWhatsApp.Toggle(true)
+		Note(HELP)
 	else
 		WoWWhatsApp.Send(msg)
 	end
 end
-
-SLASH_WOWWHATSAPP1 = "/wow-whatsapp"
-SLASH_WOWWHATSAPP2 = "/wa"
-SlashCmdList["WOWWHATSAPP"] = SlashCmdList["WOWWHATSAPP"]
 
 ---------------------------------------------------------------------------
 -- Events
@@ -2785,13 +2665,6 @@ ev:SetScript("OnEvent", function(self, event, arg1)
 			-- Still waiting after a reload: resume polling with a fresh slot pool.
 			run.sentAt = GetTime()
 			run.polls = 0
-			run.act = {}
-			for _, ch in ipairs(db.chats) do
-				if ch.pendingId then
-					-- Beats already written stay valid, so the counter catches up on its own.
-					run.act[ch.id] = { next = 1, count = 0, startedAt = GetTime() }
-				end
-			end
 			ScheduleNextPoll()
 		end
 		local c = ActiveChat()
@@ -2799,6 +2672,7 @@ ev:SetScript("OnEvent", function(self, event, arg1)
 			ui.input:SetText(c.draft)
 			if not c.pendingId then c.draft = nil end
 		end
+		run.scrollToEnd = true
 		WoWWhatsApp.Render()
 		if db.settings.shown then
 			if db.settings.minimized then

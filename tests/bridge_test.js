@@ -1,9 +1,8 @@
-// Unit tests for the bridge's pure protocol code (bridge/protocol.js).
+// Unit tests for the bridge's pure protocol code (bridge/protocol.js) and the
+// WhatsApp provider (bridge/whatsapp.js) against a fake WhatsApp Web client.
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const path = require('path');
-const os = require('os');
 const P = require('../bridge/protocol');
 const WhatsAppProvider = require('../bridge/whatsapp');
 
@@ -23,113 +22,34 @@ test('luaStr escapes everything Lua 5.1 needs', () => {
   assert.equal(P.luaStr(42), '"42"');
 });
 
-test('parseFlags reads new-session, hello, forget, context and allow lists', () => {
-  const none = { newSession: false, hello: false, forget: false, context: false, allow: [] };
+test('parseFlags reads hello and forget', () => {
+  const none = { hello: false, forget: false };
   assert.deepEqual(P.parseFlags(''), none);
-  assert.deepEqual(P.parseFlags('n'), { ...none, newSession: true });
   assert.deepEqual(P.parseFlags('h'), { ...none, hello: true });
   assert.deepEqual(P.parseFlags('d'), { ...none, forget: true });
-  assert.deepEqual(P.parseFlags('h;c'), { ...none, hello: true, context: true });
-  assert.deepEqual(P.parseFlags('n;allow=WebSearch, Bash(git:*),'), { ...none, newSession: true, allow: ['WebSearch', 'Bash(git:*)'] });
+  assert.deepEqual(P.parseFlags('n;h;x'), { ...none, hello: true }); // unknown tokens are ignored
 });
 
-test('jobsFromStrip parses the current record format and keeps separators inside text', () => {
-  const rec = ['sess', 'chat1', '12', 'realms', 'allow=WebSearch', 'My chat', 'hello\x1Fworld'].join('\x1F');
-  const jobs = P.jobsFromStrip(12, rec);
+test('jobsFromStrip parses records, keeps separators inside text, and handles several per frame', () => {
+  const rec = ['sess', '34600112233@c.us', '12', '', '', 'My chat', 'hello\x1Fworld'].join('\x1F');
+  const jobs = P.jobsFromStrip(rec);
   assert.equal(jobs.length, 1);
-  assert.deepEqual(jobs[0], { session: 'sess', chat: 'chat1', id: 12, cwd: 'realms', newSession: false, hello: false, forget: false, context: false, allow: ['WebSearch'], name: 'My chat', text: 'hello\x1Fworld', via: 'pixel' });
+  assert.deepEqual(jobs[0], { session: 'sess', chat: '34600112233@c.us', id: 12, hello: false, forget: false, name: 'My chat', text: 'hello\x1Fworld', via: 'pixel' });
+  const a = ['s', 'c1@c.us', '3', '', '', 'A', 'first'].join('\x1F');
+  const b = ['s', 'c2@g.us', '4', '', 'd', 'B', ''].join('\x1F');
+  const hello = ['s', '', '5', '', 'h', '', ''].join('\x1F');
+  const many = P.jobsFromStrip([a, b, hello].join('\x1E'));
+  assert.deepEqual(many.map(j => [j.id, j.chat, j.text, j.forget, j.hello]), [[3, 'c1@c.us', 'first', false, false], [4, 'c2@g.us', '', true, false], [5, '', '', false, true]]);
+  assert.deepEqual(P.jobsFromStrip('garbage'), []);
+  assert.deepEqual(P.jobsFromStrip(['s', 'c', 'notanumber', '', '', '', 'x'].join('\x1F')), []);
 });
 
-test('jobsFromStrip reads the game context field only when the flags say so', () => {
-  const ctx = 'Game: World of Warcraft: Forever\nCharacter: Testchar, level 23 Hunter';
-  const withCtx = ['sess', 'chat1', '13', '', 'c', 'My chat', ctx, 'is this\x1Fgood'].join('\x1F');
-  const jobs = P.jobsFromStrip(13, withCtx);
-  assert.equal(jobs[0].context, true);
-  assert.equal(jobs[0].ctx, ctx);
-  assert.equal(jobs[0].text, 'is this\x1Fgood');
-  // An empty context clears it; a hello carries one too.
-  const hello = P.jobsFromStrip(14, ['sess', 'chat1', '14', '', 'h;c', 'My chat', '', ''].join('\x1F'))[0];
-  assert.equal(hello.hello, true);
-  assert.equal(hello.ctx, '');
-  assert.equal(hello.text, '');
-  // Without the flag, a seventh field is just text with a separator in it.
-  const plain = P.jobsFromStrip(15, ['sess', 'chat1', '15', '', '', 'My chat', 'a', 'b'].join('\x1F'))[0];
-  assert.equal(plain.ctx, undefined);
-  assert.equal(plain.text, 'a\x1Fb');
-  // A "c" flag on a record too short to hold the field is not trusted.
-  const short = P.jobsFromStrip(16, ['sess', 'chat1', '16', '', 'c', 'My chat', 'only text'].join('\x1F'))[0];
-  assert.equal(short.ctx, undefined);
-  assert.equal(short.text, 'only text');
-});
-
-test('systemPrompt wraps the game context and is empty without one', () => {
-  assert.equal(P.systemPrompt(''), '');
-  assert.equal(P.systemPrompt('  \n '), '');
-  assert.equal(P.systemPrompt(undefined), '');
-  const s = P.systemPrompt('Game: World of Warcraft: Forever\nCharacter: Testchar, level 23 Hunter');
-  assert.ok(s.includes('wow-whatsapp addon'));
-  assert.ok(s.includes('\nGame: World of Warcraft: Forever\nCharacter: Testchar, level 23 Hunter\n'));
-  assert.ok(s.includes('Linked from the game'));
-  assert.ok(!s.includes('Reference for writing addons'), 'no primer section without a primer');
-  // The primer rides with the context, and only with it.
-  const withPrimer = P.systemPrompt('Character: Testchar', '# Primer\n\nUse local.');
-  assert.ok(withPrimer.endsWith('Reference for writing addons and macros for this client. Follow it when the task is about WoW, and check anything it marks as uncertain against the Blizzard UI source it names:\n\n# Primer\n\nUse local.'));
-  assert.equal(P.systemPrompt('', '# Primer'), '');
-});
-
-test('the shipped primer exists, mentions the essentials, and stays small enough to send on every run', () => {
-  const fs = require('fs');
-  const primer = fs.readFileSync(path.join(__dirname, '..', 'docs', 'WOW-ADDON-PRIMER.md'), 'utf8');
-  for (const must of ['## Interface: 120100', 'Gethe/wow-ui-source', 'InCombatLockdown', 'hooksecurefunc', 'SavedVariables', '/reload', '#showtooltip']) {
-    assert.ok(primer.includes(must), 'primer mentions ' + must);
-  }
-  assert.ok(primer.length < 9000, `primer is ${primer.length} chars; keep it under 9000 (it costs tokens on every message)`);
-});
-
-test('jobsFromStrip handles several records per frame and older formats', () => {
-  const a = ['s', 'c1', '3', '', '', 'A', 'first'].join('\x1F');
-  const b = ['s', 'c2', '4', 'C:\\x', 'n', 'second'].join('\x1F'); // no-name format
-  const c = ['s', 'C:\\y', '', 'third'].join('\x1F'); // pre-chat format
-  const jobs = P.jobsFromStrip(9, [a, b, c].join('\x1E'));
-  assert.deepEqual(jobs.map(j => [j.id, j.chat, j.text, j.newSession]), [[3, 'c1', 'first', false], [4, 'c2', 'second', true], [9, '', 'third', false]]);
-  assert.deepEqual(P.jobsFromStrip(1, 'garbage'), []);
-  assert.deepEqual(P.jobsFromStrip(1, ['s', 'c', 'notanumber', '', '', '', 'x'].join('\x1F')), []);
-});
-
-test('parseOutbox decodes the SavedVariables fallback', () => {
+test('parseOutbox decodes the SavedVariables fallback, chat id included', () => {
   const hex = s => Buffer.from(s, 'utf8').toString('hex');
-  const src = `WoWWhatsAppDB = {\n["outbox"] = {\n["id"] = 7,\n["session"] = "abc123",\n["chat"] = "c1",\n["text"] = "${hex('héllo')}",\n["cwd"] = "${hex('realms')}",\n["newSession"] = true,\n},\n["settings"] = {},\n}`;
-  assert.deepEqual(P.parseOutbox(src), { id: 7, session: 'abc123', chat: 'c1', text: 'héllo', cwd: 'realms', newSession: true, via: 'reload' });
-  const withCtx = src.replace('["newSession"]', `["ctx"] = "${hex('Character: Testchar')}",\n["newSession"]`);
-  assert.equal(P.parseOutbox(withCtx).ctx, 'Character: Testchar');
+  const src = `WoWWhatsAppDB = {\n["outbox"] = {\n["id"] = 7,\n["session"] = "abc123",\n["chat"] = "${hex('34600112233@c.us')}",\n["text"] = "${hex('héllo')}",\n},\n["settings"] = {},\n}`;
+  assert.deepEqual(P.parseOutbox(src), { id: 7, session: 'abc123', chat: '34600112233@c.us', text: 'héllo', via: 'reload' });
   assert.equal(P.parseOutbox('WoWWhatsAppDB = {}'), null);
   assert.equal(P.parseOutbox('["outbox"] = { ["text"] = "" }'), null);
-});
-
-test('resolveCwd: empty is the default, relative joins it, ~ is home, absolute wins', () => {
-  const base = path.resolve('C:\\work\\proj');
-  assert.equal(P.resolveCwd('', base), base);
-  assert.equal(P.resolveCwd('  ', base), base);
-  assert.equal(P.resolveCwd('realms', base), path.join(base, 'realms'));
-  assert.equal(P.resolveCwd('./realms/', base), path.join(base, 'realms'));
-  assert.equal(P.resolveCwd('../other', base), path.resolve(base, '..', 'other'));
-  assert.equal(P.resolveCwd('~/x', base), path.join(os.homedir(), 'x'));
-  assert.equal(P.resolveCwd('D:\\elsewhere', base), path.resolve('D:\\elsewhere'));
-  assert.ok(P.sameFolder('C:\\A\\b\\', 'c:/a/B'));
-  assert.ok(!P.sameFolder('C:\\a', 'C:\\a\\b'));
-});
-
-test('ruleFor turns denials into prefix rules', () => {
-  assert.equal(P.ruleFor({ tool_name: 'WebSearch' }), 'WebSearch');
-  assert.equal(P.ruleFor({ tool_name: 'Bash', tool_input: { command: 'cargo build --release' } }), 'Bash(cargo:*)');
-  assert.equal(P.ruleFor({ tool_name: 'Bash', tool_input: { command: '"C:\\weird path\\x.exe" arg' } }), 'Bash');
-  assert.equal(P.ruleFor({}), 'Unknown');
-});
-
-test('describeToolUse gives one short line per tool call', () => {
-  assert.equal(P.describeToolUse({ name: 'Bash', input: { command: 'npm test\nsecond line' } }), '$ npm test');
-  assert.equal(P.describeToolUse({ name: 'Edit', input: { file_path: 'C:\\x\\player.gd' } }), 'edit player.gd');
-  assert.equal(P.describeToolUse({ name: 'Mystery' }), 'Mystery');
 });
 
 test('handled ids are tracked per session token and capped', () => {
@@ -169,4 +89,91 @@ test('slotNumber wraps and SILENT_WAV is a valid RIFF header', () => {
   assert.equal(P.chatKey({ session: 's', chat: 'c' }), 's:c');
   assert.equal(P.sessKey({ session: 's', chat: 'c' }), 'chat:c');
   assert.equal(P.sessKey({ session: 's', chat: '' }), 's:default');
+});
+
+// ---------------------------------------------------------------------------
+// The provider, with a fake WhatsApp Web client
+// ---------------------------------------------------------------------------
+
+function fakeClient(opts = {}) {
+  const calls = [];
+  return {
+    calls,
+    getNumberId: async number => { calls.push(['getNumberId', number]); return opts.registered === false ? null : { _serialized: number + '@c.us' }; },
+    sendMessage: async (id, text) => { calls.push(['send', id, text]); if (opts.delay) await new Promise(r => setTimeout(r, opts.delay(text))); },
+    getChatById: async id => ({ sendSeen: async () => calls.push(['seen', id]), name: 'Ana' }),
+    getContactById: async id => ({ pushname: 'Ana', number: id.split('@')[0] }),
+    destroy: async () => {},
+  };
+}
+
+function provider(client, handlers = {}) {
+  const p = new WhatsAppProvider({}, handlers);
+  p.client = client;
+  p.ready = true;
+  return p;
+}
+
+test('send refuses a chat id that is not a WhatsApp id, with a hint', async () => {
+  const p = provider(fakeClient());
+  await assert.rejects(p.send('abc123', 'hi'), /not a WhatsApp chat id/);
+  await assert.rejects(p.send('', 'hi'), /no WhatsApp recipient/);
+});
+
+test('send to a typed phone number looks it up once and uses the id WhatsApp gives', async () => {
+  const client = fakeClient();
+  const p = provider(client);
+  await p.send('34600112233@c.us', 'hola');
+  await p.send('34600112233@c.us', 'otra vez');
+  assert.deepEqual(client.calls.filter(c => c[0] !== 'seen'), [
+    ['getNumberId', '34600112233'], ['send', '34600112233@c.us', 'hola'], ['send', '34600112233@c.us', 'otra vez'],
+  ]);
+  const unknown = provider(fakeClient({ registered: false }));
+  await assert.rejects(unknown.send('34000000000@c.us', 'hi'), /is not on WhatsApp/);
+});
+
+test('sends go out one at a time, in order, and one failure does not block the next', async () => {
+  const client = fakeClient({ delay: text => text === 'slow' ? 40 : 0 });
+  const p = provider(client);
+  const results = await Promise.allSettled([p.send('1234567@g.us', 'slow'), p.send('bad', 'x'), p.send('1234567@g.us', 'fast')]);
+  assert.deepEqual(results.map(r => r.status), ['fulfilled', 'rejected', 'fulfilled']);
+  assert.deepEqual(client.calls.filter(c => c[0] === 'send').map(c => c[2]), ['slow', 'fast']);
+});
+
+test('messages typed on the phone are mirrored, the ones sent from WoW are not, and status updates are ignored', async () => {
+  const client = fakeClient();
+  const got = [];
+  const p = provider(client, { message: m => got.push(m) });
+  const base = { fromMe: true, type: 'chat', timestamp: 1700000000, getChat: async () => ({ name: 'Ana' }) };
+  // Sent from WoW: remembered by send(), so its message_create echo is dropped.
+  await p.send('34600112233@c.us', 'from wow');
+  await p.onMessage({ ...base, to: '34600112233@c.us', body: 'from wow', id: { _serialized: 'a' } });
+  // Typed on the phone: shown as ours.
+  await p.onMessage({ ...base, to: '34600112233@c.us', body: 'from phone', id: { _serialized: 'b' } });
+  // The same text typed again on the phone is not swallowed by the earlier echo.
+  await p.onMessage({ ...base, to: '34600112233@c.us', body: 'from wow', id: { _serialized: 'c' } });
+  // Status updates and channels are not conversations.
+  await p.onMessage({ ...base, fromMe: false, from: 'status@broadcast', body: 'status', id: { _serialized: 'd' } });
+  await p.onMessage({ ...base, fromMe: false, from: '1@newsletter', body: 'news', id: { _serialized: 'e' } });
+  // A message from a contact.
+  await p.onMessage({ type: 'chat', from: '34600112233@c.us', body: 'hello', timestamp: 1700000001, id: { _serialized: 'f' },
+    getChat: async () => ({ name: 'Ana' }), getContact: async () => ({ pushname: 'Ana' }) });
+  assert.deepEqual(got.map(m => [m.text, m.fromMe, m.chat, m.chatName]), [
+    ['from phone', true, '34600112233@c.us', 'Ana'],
+    ['from wow', true, '34600112233@c.us', 'Ana'],
+    ['hello', false, '34600112233@c.us', 'Ana'],
+  ]);
+});
+
+test('a message sent while WhatsApp Web is still starting waits for it, then goes out', async () => {
+  const client = fakeClient();
+  const p = provider(client);
+  p.ready = false;
+  const sending = p.send('1234567@g.us', 'early');
+  await new Promise(r => setTimeout(r, 20));
+  assert.equal(client.calls.length, 0);
+  p.ready = true;
+  for (const resolve of p.readyWaiters.splice(0)) resolve();
+  await sending;
+  assert.equal(client.calls[0][2], 'early');
 });

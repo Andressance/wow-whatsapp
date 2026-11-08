@@ -2,14 +2,14 @@
 'use strict';
 // One-shot installer.
 //
-//   node setup.js [--wow "<client folder>"] [--project "<default work folder>"] [--account <name>]
+//   node setup.js [--wow "<client folder>"] [--account <name>]
 //
 // Finds the WoW: Forever client, copies the addon into Interface\AddOns, writes
 // bridge/config.json from the example (if missing), and builds the slot pool.
-// Re-running is safe: existing config and generated files are kept.
+// Re-running is safe: existing config and generated files are kept. A config
+// still on the beta client moves to Forever once Forever is installed.
 
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
@@ -31,20 +31,30 @@ function isClient(dir) {
   } catch { return false; }
 }
 
+// The client folder an existing config.json points at.
+function configuredClient() {
+  try { return path.dirname(path.dirname(JSON.parse(fs.readFileSync(CONFIG, 'utf8')).addonDir)); } catch { return null; }
+}
+
 function findClient() {
   if (args.wow) {
     if (isClient(args.wow)) return args.wow;
     throw new Error(`--wow "${args.wow}" does not look like a WoW client folder (needs Interface\\ and a Wow*.exe)`);
   }
+  // A re-run stays on its client, unless that's the beta: Forever replaced it.
+  const current = configuredClient();
+  if (current && isClient(current) && path.basename(current) !== '_classic_beta_') return current;
   const roots = [process.env['ProgramFiles(x86)'], process.env.ProgramFiles, 'D:\\', 'E:\\', 'D:\\Games', 'E:\\Games', 'C:\\Games']
     .filter(Boolean).map(r => path.join(r, 'World of Warcraft'));
+  if (current) roots.unshift(path.dirname(current));
   for (const root of roots) {
-    for (const flavor of ['_classic_beta_', '_forever_', '_retail_', '_classic_era_', '_classic_']) {
+    // The beta folder can outlive the beta: Forever goes first.
+    for (const flavor of ['_forever_', '_classic_beta_', '_retail_', '_classic_era_', '_classic_']) {
       const dir = path.join(root, flavor);
       if (isClient(dir)) return dir;
     }
   }
-  throw new Error('Could not find the WoW client. Pass --wow "C:\\path\\to\\World of Warcraft\\_classic_beta_"');
+  throw new Error('Could not find the WoW client. Pass --wow "C:\\path\\to\\World of Warcraft\\_forever_"');
 }
 
 function findAccount(client) {
@@ -55,7 +65,9 @@ function findAccount(client) {
     if (!names.includes(args.account)) throw new Error(`Account "${args.account}" not found under ${base}`);
     return args.account;
   }
-  if (!names.length) throw new Error(`No account folder under ${base}. Log into the game once, then run setup again.`);
+  // The game creates this folder at the first login. Everything else can be
+  // installed before that (slots must exist when the game launches).
+  if (!names.length) return null;
   if (names.length > 1) console.log(`Several accounts found (${names.join(', ')}); using "${names[0]}". Pass --account to choose another.`);
   return names[0];
 }
@@ -73,18 +85,36 @@ function copyAddon(client) {
   return { dest, copied };
 }
 
-function writeConfig(client, account) {
-  if (fs.existsSync(CONFIG)) {
-    console.log(`config   : ${CONFIG} already exists, keeping it`);
-    return JSON.parse(fs.readFileSync(CONFIG, 'utf8'));
-  }
-  const cfg = JSON.parse(fs.readFileSync(EXAMPLE, 'utf8'));
+// The game exe without .exe, as the capture looks for it.
+function processNameOf(client) {
+  const exe = fs.readdirSync(client).find(f => /^Wow.*\.exe$/i.test(f));
+  return exe ? exe.replace(/\.exe$/i, '') : null;
+}
+
+function pointAtClient(cfg, client, account) {
   cfg.addonDir = path.join(client, 'Interface', 'AddOns');
   cfg.inboxFile = path.join(cfg.addonDir, 'WoWWhatsApp', 'Inbox.lua');
-  cfg.savedVariablesFile = path.join(client, 'WTF', 'Account', account, 'SavedVariables', 'WoWWhatsApp.lua');
-  cfg.defaultCwd = args.project ? path.resolve(args.project) : process.cwd();
-  const exe = fs.readdirSync(client).find(f => /^Wow.*\.exe$/i.test(f));
-  if (exe) cfg.capture.processName = exe.replace(/\.exe$/i, '');
+  cfg.savedVariablesFile = account ? path.join(client, 'WTF', 'Account', account, 'SavedVariables', 'WoWWhatsApp.lua') : '';
+  const processName = processNameOf(client);
+  if (processName) cfg.capture = { ...cfg.capture, processName };
+}
+
+function writeConfig(client, account) {
+  if (fs.existsSync(CONFIG)) {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG, 'utf8'));
+    const moved = path.resolve(cfg.addonDir || '').toLowerCase() !== path.resolve(client, 'Interface', 'AddOns').toLowerCase();
+    if (moved) pointAtClient(cfg, client, account);
+    else if (account && !cfg.savedVariablesFile) pointAtClient(cfg, client, account);
+    else {
+      console.log(`config   : ${CONFIG} already exists, keeping it`);
+      return cfg;
+    }
+    fs.writeFileSync(CONFIG, JSON.stringify(cfg, null, 2) + '\n');
+    console.log(`config   : ${CONFIG} updated for ${path.basename(client)}; everything else kept`);
+    return cfg;
+  }
+  const cfg = JSON.parse(fs.readFileSync(EXAMPLE, 'utf8'));
+  pointAtClient(cfg, client, account);
   fs.writeFileSync(CONFIG, JSON.stringify(cfg, null, 2) + '\n');
   console.log(`config   : wrote ${CONFIG}`);
   return cfg;
@@ -94,11 +124,10 @@ try {
   const client = findClient();
   console.log(`client   : ${client}`);
   const account = findAccount(client);
-  console.log(`account  : ${account}`);
+  console.log(`account  : ${account || 'none yet (the game creates it at your first login; set savedVariablesFile in config.json later if you use the reload fallback)'}`);
   const { dest, copied } = copyAddon(client);
   console.log(`addon    : ${copied} file(s) -> ${dest}`);
-  const cfg = writeConfig(client, account);
-  console.log(`project  : ${cfg.defaultCwd}  (change with /wow-whatsapp cd in game, or defaultCwd in config.json)`);
+  writeConfig(client, account);
   console.log('slots    : building the reply-slot pool and signal files...');
   const r = spawnSync(process.execPath, [path.join(BRIDGE, 'install-slots.js')], { stdio: 'inherit' });
   if (r.status !== 0) throw new Error('install-slots.js failed');
@@ -107,7 +136,7 @@ Done. Next:
   1. Fully quit and relaunch World of Warcraft (it only discovers new addon files at launch).
   2. Enable "WoW WhatsApp" at the character select AddOns screen (the WoW WhatsApp slot ### entries stay enabled).
   3. Start the bridge:  npm start   (in this terminal; bridge\\start-window.cmd opens its own window)
-  4. In game:  /wow-whatsapp
+  4. In game:  /wa
 `);
 } catch (e) {
   console.error('setup failed:', e.message);

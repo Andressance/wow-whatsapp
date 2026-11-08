@@ -1,5 +1,5 @@
-// A slot file carrying replies, a denied-tools list and a restore bundle must be
-// valid Lua that the addon can read back field by field.
+// A slot file carrying messages, an error and a restore bundle must be valid Lua
+// that the addon can read back field by field.
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -35,32 +35,40 @@ function readSlot(src, globalName) {
   return value(assign.init[0]);
 }
 
-test('slot file round-trips replies, denied rules, cwd and a restore bundle', () => {
+test('slot file round-trips messages, flags and a restore bundle', () => {
   const restore = {
     token: 'tok1',
-    chats: [{ id: 'c1', name: 'realms', cwd: 'C:\\x\\y', messages: [
+    chats: [{ id: 'c1@c.us', name: 'realms', messages: [
       { role: 'user', id: 1, t: 1, text: 'hi "there"\nnew line' },
-      { role: 'whatsapp', id: 1, t: 2, text: 'hello | pipe \\ backslash' },
+      { role: 'contact', id: 1, t: 2, sender: 'Ana', replyTo: 'You', text: 'hello | pipe \\ backslash' },
     ] }],
   };
   const lua = P.luaTable('WoWWhatsApp_SlotData',
-    [{ chat: 'c9', id: 3, status: 'done', text: 'ok\ttab', denied: ['WebSearch', 'Bash(cargo:*)'] }],
-    { cwd: 'C:\\proj', restore, now: 1700000000123 });
+    [
+      { chat: 'c9@g.us', id: 3, status: 'incoming', text: 'ok\ttab', isGroup: true, sender: 'Ana', timestamp: 1700000099 },
+      { chat: 'c9@g.us', id: 4, status: 'incoming', text: 'from my phone', fromMe: true },
+      { chat: 'c9@g.us', id: 5, status: 'error', text: 'WhatsApp is not connected' },
+    ],
+    { restore, now: 1700000000123 });
   const d = readSlot(lua, 'WoWWhatsApp_SlotData');
   assert.equal(d.now, 1700000000);
-  assert.equal(d.cwd, 'C:\\proj');
-  assert.equal(d.replies.length, 1);
-  assert.deepEqual(d.replies[0].denied, ['WebSearch', 'Bash(cargo:*)']);
+  assert.equal(d.replies.length, 3);
   assert.equal(d.replies[0].text, 'ok\ttab');
+  assert.equal(d.replies[0].isGroup, true);
+  assert.equal(d.replies[0].timestamp, 1700000099);
+  assert.equal(d.replies[0].fromMe, undefined);
+  assert.equal(d.replies[1].fromMe, true);
+  assert.equal(d.replies[1].timestamp, undefined);
+  assert.equal(d.replies[2].status, 'error');
   assert.equal(d.restore.token, 'tok1');
   assert.equal(d.restore.chats.length, 1);
   assert.equal(d.restore.chats[0].messages[0].text, 'hi "there"\nnew line');
   assert.equal(d.restore.chats[0].messages[1].text, 'hello | pipe \\ backslash');
+  assert.equal(d.restore.chats[0].messages[1].sender, 'Ana');
 });
 
 test('slot file without a restore has no restore field and tolerates empty records', () => {
-  const d = readSlot(P.luaTable('WoWWhatsApp_Inbox', [], { cwd: '' }), 'WoWWhatsApp_Inbox');
-  assert.equal(d.cwd, '');
+  const d = readSlot(P.luaTable('WoWWhatsApp_Inbox', []), 'WoWWhatsApp_Inbox');
   assert.equal(d.restore, undefined);
   assert.deepEqual(d.replies, {}); // an empty Lua table
 });

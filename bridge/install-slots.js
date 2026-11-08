@@ -10,7 +10,6 @@ const path = require('path');
 const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, 'config.json'), 'utf8'));
 const addons = cfg.addonDir;
 const N = cfg.slots || 200;
-const ACT = cfg.actMax || 60;
 const PRESENCE = cfg.presenceMax || 2000;
 const INCOMING = cfg.incomingMax || 2000;
 const iface = cfg.tocInterface || '16001';
@@ -51,10 +50,6 @@ for (let i = 1; i <= N; i++) {
   ensure(path.join(dir, 'Inbox.lua'), 'WoWWhatsApp_SlotData = nil\n');
   ensure(path.join(addons, 'WoWWhatsApp', 'sig', String(i).padStart(3, '0') + '.wav'), '');
   ensure(path.join(addons, 'WoWWhatsApp', 'ack', String(i).padStart(3, '0') + '.wav'), '');
-  // Heartbeat files: one per WhatsApp action, flipped valid by the bridge as it works.
-  for (let k = 1; k <= ACT; k++) {
-    ensure(path.join(addons, 'WoWWhatsApp', 'act', String(i).padStart(3, '0'), String(k).padStart(2, '0') + '.wav'), '');
-  }
 }
 
 // Presence files: the bridge flips one every 30 s so the game can show "connected".
